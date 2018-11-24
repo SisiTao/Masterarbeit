@@ -44,7 +44,7 @@ def main(args):
         validation_paths += (validation_set[i].lidarscan_paths[1], validation_set[i].lidarscan_paths[2])
         validation_paths += (validation_set[i].lidarscan_paths[2], validation_set[i].lidarscan_paths[3])
         validation_paths += (
-        validation_set[i].lidarscan_paths[3], validation_set[i].lidarscan_paths[0])  # 8 paths are appended
+            validation_set[i].lidarscan_paths[3], validation_set[i].lidarscan_paths[0])  # 8 paths are appended
     actual_issame += [True] * (len(validation_set) * 4)
     # pairs contain lidarscans from the different classes/places: 4 pairs for each class
     for j in range(2):
@@ -58,9 +58,9 @@ def main(args):
                 if (class2_idx, class0_idx) in idx_pairs:
                     class2_idx = np.random.randint(len(validation_set))
             validation_paths += (
-            validation_set[class0_idx].lidarscan_paths[j], validation_set[class1_idx].lidarscan_paths[j])
+                validation_set[class0_idx].lidarscan_paths[j], validation_set[class1_idx].lidarscan_paths[j])
             validation_paths += (
-            validation_set[class0_idx].lidarscan_paths[j], validation_set[class2_idx].lidarscan_paths[j])
+                validation_set[class0_idx].lidarscan_paths[j], validation_set[class2_idx].lidarscan_paths[j])
             # take the first(j=0) or second(j=1) lidarscans of each class as anchor-negative pairs
             idx_pairs += ((class0_idx, class1_idx), (class0_idx, class2_idx))
     actual_issame += [False] * (len(validation_set) * 4)
@@ -126,7 +126,7 @@ def main(args):
         # 4*3 lidarscans,labels,coors after loop
 
         lidarscan_batch, labels_batch, coordinates_batch = tf.train.batch_join(
-            lidarscans_and_labels_and_coordinates, batch_size=batch_size_placeholder, #！！！！！batch size??
+            lidarscans_and_labels_and_coordinates, batch_size=batch_size_placeholder,  # ！！！！！batch size??
             shapes=[(256000), (), (2)], enqueue_many=True,
             capacity=4 * nrof_preprocess_threads * args.batch_size,
             allow_smaller_final_batch=True)
@@ -137,9 +137,9 @@ def main(args):
 
         # Build the inference graph
         prelogits, reg_term = network.inference(lidarscan_batch, args.keep_probability,
-                                         is_training=is_training_placeholder,
-                                         bottleneck_layer_size=args.embedding_size,
-                                         weight_decay=args.weight_decay)
+                                                is_training=is_training_placeholder,
+                                                bottleneck_layer_size=args.embedding_size,
+                                                weight_decay=args.weight_decay)
 
         embeddings = tf.nn.l2_normalize(prelogits, 1e-10, name='embeddings')
         # Split embeddings into anchor, positive and negative and calculate triplet loss
@@ -150,7 +150,7 @@ def main(args):
 
         # Calculate the total losses
         # regularization_losses = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)  # 具体怎么得到还没写！
-        regularization_losses = reg_term # temporary used for simple network
+        regularization_losses = reg_term  # temporary used for simple network
         total_loss = tf.add_n([triplet_loss] + regularization_losses, name='total_loss')
 
         # Build a Graph that trains the model with one batch of examples and updates the model parameters
@@ -161,7 +161,7 @@ def main(args):
         saver = tf.train.Saver(tf.trainable_variables(), max_to_keep=3)
 
         # Build the summary operation based on the TF collection of Summaries.
-        summary_op = tf.summary.merge_all() # not used
+        summary_op = tf.summary.merge_all()  # not used
 
         # Start running operations on the Graph.
         gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=args.gpu_memory_fraction)  # GPU的设置 还没看
@@ -222,7 +222,7 @@ def train(args, learning_rate_schedule_file, epoch, dataset, sess, enqueue_op, l
         print('Running forward pass on sampled datascans: ', end='')
         start_time = time.time()
         nrof_examples = args.places_per_batch * args.lidarscans_per_place
-        places_per_batch=len(num_per_class)
+        places_per_batch = len(num_per_class)
         # Here the number of places_per_batch is not equal to args.places_per_batch.
         # Because some lidarscans_per_place may less than args.lidarscans_per_place
 
@@ -256,20 +256,20 @@ def train(args, learning_rate_schedule_file, epoch, dataset, sess, enqueue_op, l
         nrof_examples = len(triplet_paths)
         labels_array = np.reshape(np.arange(nrof_examples), (-1, 3))
         triplet_paths_array = np.reshape(np.expand_dims(np.array(triplet_paths), 1), (-1, 3))
-        sess.run(enqueue_op, # input nrof_examples lidarscans in queue
+        sess.run(enqueue_op,  # input nrof_examples lidarscans in queue
                  feed_dict={lidarscan_paths_placeholder: triplet_paths_array, labels_placeholder: labels_array})
         train_time = 0
         emb_array = np.zeros((nrof_examples, embedding_size))
         # loss_array = np.zeros((nrof_triplets,))  # 不是应该nrof_batches吗,而且这个array好像用不上; not used
         summary = tf.Summary()
         step = 0
-        for i in range(nrof_batches): # all examples are dequeued
+        for i in range(nrof_batches):  # all examples are dequeued
             start_time = time.time()
             batch_size = min(nrof_examples - i * args.batch_size, args.batch_size)
             feed_dict = {batch_size_placeholder: batch_size, learning_rate_placeholder: lr,
                          is_training_placeholder: True}
             err, _, step, emb, lab = sess.run([loss, train_op, global_step, embeddings, labels_batch],
-                                              feed_dict=feed_dict) # dequeue batch_size examples for training
+                                              feed_dict=feed_dict)  # dequeue batch_size examples for training
             emb_array[lab, :] = emb  # 这里其实用不上，因为train_op里已经计算了 not used
             # loss_array[i] = err # not used
             duration = time.time() - start_time
@@ -323,20 +323,21 @@ def evaluate(sess, validation_paths, embeddings, enqueue_op, batch_size_placehol
 
 
 def calculate_accuracy(embeddings, actual_issame, nrof_folds=10):
-    embeddings1 = embeddings[0::2] # The embeddings of the first lidarscan in each pair
-    embeddings2 = embeddings[1::2] # The embeddings of the second lidarscan in each pair
+    embeddings1 = embeddings[0::2]  # The embeddings of the first lidarscan in each pair
+    embeddings2 = embeddings[1::2]  # The embeddings of the second lidarscan in each pair
     assert (embeddings1.shape[0] == embeddings2.shape[0])
     assert (embeddings1.shape[1] == embeddings2.shape[1])
+
     nrof_pairs = len(actual_issame)  # 源代码用了actual_issame和embeddings1.shape[0]的最小值，但其实是一样的呀？
     indices = np.arange(nrof_pairs)
-
     thresholds = np.arange(0, 4, 0.01)  # 这个范围怎么确定的？how to determine this range?
     nrof_thresholds = len(thresholds)
-    k_fold = KFold(n_splits=nrof_folds, shuffle=False)
 
     distance = np.sum(np.square(np.subtract(embeddings1, embeddings2)), 1)
+    assert (len(distance) == len(actual_issame))
     accuracy = np.zeros((nrof_folds))
 
+    k_fold = KFold(n_splits=nrof_folds, shuffle=True)
     for fold_idx, (train_set, test_set) in enumerate(k_fold.split(indices)):
         # Find the best threshold for the fold using train_set
         accuracy_train = np.zeros((nrof_thresholds))
@@ -362,11 +363,11 @@ def select_triplets(coordinates, nrof_lidarscans_per_place, lidarscan_paths, pla
     for i in range(places_per_batch):
         nrof_lidarscans = int(nrof_lidarscans_per_place[i])  # lidarscans around the same place
         for j in range(1, nrof_lidarscans):
-            a_idx = start_idx + j - 1 # anchor
+            a_idx = start_idx + j - 1  # anchor
             neg_dists = np.sqrt(np.sum(np.square(coordinates[a_idx] - coordinates), 1))
             neg_dists[start_idx:start_idx + nrof_lidarscans] = np.NaN
             for pair in range(j, nrof_lidarscans):
-                p_idx = start_idx + pair # all the other lidarscans in the same class are combined with anchor as positive pairs
+                p_idx = start_idx + pair  # all the other lidarscans in the same class are combined with anchor as positive pairs
                 pos_dist = np.sqrt(np.sum(np.square(coordinates[a_idx] - coordinates[p_idx])))
                 all_neg = np.where(neg_dists - pos_dist < alpha)[0]
                 # the negative distances should not be too big(hard negative, faster convergence
@@ -403,13 +404,13 @@ def sample_places(dataset, places_per_batch, lidarscans_per_place):
         nrof_lidarscans_in_class = len(dataset[class_index])
         lidarscan_indices = np.arange(nrof_lidarscans_in_class)
         np.random.shuffle(lidarscan_indices)
-        nrof_lidarscans_from_class=min(lidarscans_per_place,nrof_lidarscans_in_class,nrof_lidarscans-len(lidarscan_paths))
+        nrof_lidarscans_from_class = min(lidarscans_per_place, nrof_lidarscans_in_class,
+                                         nrof_lidarscans - len(lidarscan_paths))
         idx = lidarscan_indices[0:nrof_lidarscans_from_class]
         lidarscan_paths_for_class = [dataset[class_index].lidarscan_paths[j] for j in idx]
         lidarscan_paths += lidarscan_paths_for_class
         num_per_class.append(nrof_lidarscans_from_class)
         i += 1
-
 
     return lidarscan_paths, num_per_class
 
@@ -456,25 +457,25 @@ def parse_arguments(argv):
     parser.add_argument('--max_nrof_epochs', type=int,
                         help='Number of epochs to run.', default=500)
     parser.add_argument('--batch_size', type=int,
-                        help='Number of lidar_scans to process in a batch.', default=90)
+                        help='Number of lidar_scans to process in a batch.(used in evaluation)', default=50)
     # parser.add_argument('--image_size', type=int,
-                       # help='Image size (height, width) in pixels.', default=160)
+    #                   help='Image size (height, width) in pixels.', default=160)
     parser.add_argument('--places_per_batch', type=int,
-                        help='Number of people per batch.', default=45)
+                        help='Number of places(or classes) per batch.', default=20)
     parser.add_argument('--lidarscans_per_place', type=int,
-                        help='Number of lidarscans per place.', default=40)
+                        help='Number of lidarscans per place.', default=10)
     parser.add_argument('--epoch_size', type=int,
                         help='Number of batches per epoch.', default=1000)
     parser.add_argument('--alpha', type=float,
                         help='Positive to negative triplet distance margin.', default=0.2)
     parser.add_argument('--embedding_size', type=int,
                         help='Dimensionality of the embedding.', default=128)
-    parser.add_argument('--random_crop',
-                        help='Performs random cropping of training images. If false, the center image_size pixels from the training images are used. ' +
-                             'If the size of the images in the data directory is equal to image_size no cropping is performed',
-                        action='store_true')
-    parser.add_argument('--random_flip',
-                        help='Performs random horizontal flipping of training images.', action='store_true')
+    # parser.add_argument('--random_crop',
+    #                     help='Performs random cropping of training images. If false, the center image_size pixels from the training images are used. ' +
+    #                          'If the size of the images in the data directory is equal to image_size no cropping is performed',
+    #                     action='store_true')
+    # parser.add_argument('--random_flip',
+    #                     help='Performs random horizontal flipping of training images.', action='store_true')
     parser.add_argument('--keep_probability', type=float,
                         help='Keep probability of dropout for the fully connected layer(s).', default=1.0)
     parser.add_argument('--weight_decay', type=float,
@@ -495,6 +496,8 @@ def parse_arguments(argv):
     parser.add_argument('--learning_rate_schedule_file', type=str,
                         help='File containing the learning rate schedule that is used when learning_rate is set to to -1.',
                         default='data/learning_rate_schedule.txt')
+    parser.add_argument('--nrof_folds', type=int,
+                        help='Number of folds to use for cross validation. Mainly used for testing.', default=10)
 
     return parser.parse_args(argv)
 

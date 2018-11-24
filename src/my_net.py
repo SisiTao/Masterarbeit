@@ -2,7 +2,7 @@ import os
 import tensorflow as tf
 
 
-def get_dataset(path):  # 还没写完！
+def get_dataset(path):
     dataset = []
     path_exp = os.path.expanduser(path)
     classes = [path for path in os.listdir(path_exp) if os.path.isdir(os.path.join(path_exp, path))]
@@ -19,7 +19,7 @@ def get_dataset(path):  # 还没写完！
 
 
 class LidarClass():
-    "Stores the paths to lidarscans for a given class 其实没有用到class_name"
+    """Stores the paths to lidarscans for a given class 其实没有用到class_name"""
 
     def __init__(self, name, lidarscan_paths):
         self.name = name
@@ -77,7 +77,7 @@ def train(total_loss, global_step, optimizer, learning_rate, moving_average_deca
     # Track the moving averages of all trainable variables.
     variable_averages = tf.train.ExponentialMovingAverage(
         moving_average_decay, global_step)
-    variables_averages_op = variable_averages.apply(tf.trainable_variables())
+    variables_averages_op = variable_averages.apply(tf.trainable_variables()) # not used ???????
 
     with tf.control_dependencies([apply_gradient_op, variables_averages_op]):
         train_op = tf.no_op(name='train')
@@ -101,3 +101,30 @@ def get_learning_rate_from_file(filename, epoch):
                         lr = float(par[1])
                     learning_rate = lr
                     return learning_rate
+
+
+def _add_loss_summaries(total_loss):
+    """Add summaries for losses.
+
+    Generates moving average for all losses and associated summaries for
+    visualizing the performance of the network.
+
+    Args:
+      total_loss: Total loss from loss().
+    Returns:
+      loss_averages_op: op for generating moving averages of losses.
+    """
+    # Compute the moving average of all individual losses and the total loss.
+    loss_averages = tf.train.ExponentialMovingAverage(0.9, name='avg')
+    losses = tf.get_collection('losses')
+    loss_averages_op = loss_averages.apply(losses + [total_loss])
+
+    # Attach a scalar summmary to all individual losses and the total loss; do the
+    # same for the averaged version of the losses.
+    for l in losses + [total_loss]:
+        # Name each loss as '(raw)' and name the moving average version of the loss
+        # as the original loss name.
+        tf.summary.scalar(l.op.name + ' (raw)', l)
+        tf.summary.scalar(l.op.name, loss_averages.average(l))
+
+    return loss_averages_op
