@@ -11,7 +11,8 @@ def get_dataset(path):
     for i in range(nrof_classes):
         class_name = classes[i]
         class_dir = os.path.join(path_exp, class_name)
-        lidarscans = os.listdir(class_dir)
+        lidarscans_and_globalegos = os.listdir(class_dir)
+        lidarscans=[name for name in lidarscans_and_globalegos if 'scan' in name]
         lidarscan_paths = [os.path.join(class_dir, lid) for lid in lidarscans]
         dataset.append(LidarClass(class_name, lidarscan_paths))
 
@@ -77,7 +78,7 @@ def train(total_loss, global_step, optimizer, learning_rate, moving_average_deca
     # Track the moving averages of all trainable variables.
     variable_averages = tf.train.ExponentialMovingAverage(
         moving_average_decay, global_step)
-    variables_averages_op = variable_averages.apply(tf.trainable_variables()) # not used ???????
+    variables_averages_op = variable_averages.apply(tf.trainable_variables())  # not used ???????
 
     with tf.control_dependencies([apply_gradient_op, variables_averages_op]):
         train_op = tf.no_op(name='train')

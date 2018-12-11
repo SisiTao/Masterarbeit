@@ -89,6 +89,10 @@ def main(args):
                                               shared_name=None, name=None)
         enqueue_op = input_queue.enqueue_many([lidarscan_paths_placeholder, labels_placeholder])
 
+        # Start running operations on the Graph.
+        gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=args.gpu_memory_fraction)  # GPU的设置 还没看
+        sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options))
+
         nrof_preprocess_threads = 4
         lidarscans_and_labels_and_coordinates = []
         for _ in range(nrof_preprocess_threads):
@@ -96,24 +100,25 @@ def main(args):
             lidarscans = []
             coordinates = []
             for filename in tf.unstack(filenames):
-                lidarscan = np.fromfile(filename, dtype=np.float32)
-                lidarscan = np.reshape(lidarscan, [2, 128000])
-
-                coordinate_filename = filename.replace('velodyne_scan', 'global_ego_data')
-                coordinate = np.fromfile(coordinate_filename, dtype=np.float64)[
-                             16:18]  # easting and northing coordinate
+                file_contents = tf.read_file(filename)
+                lidarscan = tf.decode_raw(file_contents, tf.float32)
+                lidarscan = tf.reshape(lidarscan, [2, 128000])
+                coordinate_filename = tf.strings.regex_replace(filename, 'velodyne_scan', 'global_ego_data')
+                coordinate = tf.decode_raw(tf.read_file(coordinate_filename), tf.float64)[16:18]
+                # easting and northing coordinate
 
                 # per lidarscan normalization
-                mean = np.reshape(lidarscan.mean(axis=1), (2, 1))  # ((distance_mean),(reflection_mean))
+                mean = tf.reduce_mean(lidarscan, axis=1, keepdims=True)  # ((distance_mean),(reflection_mean))
                 lidarscan -= mean
-                std = np.reshape(lidarscan.std(axis=1), (2, 1))  # ((distance_std),(reflection_std))
+
+                _, var = tf.nn.moments(lidarscan, axes=1, keep_dims=True)
+                std = tf.sqrt(var)  # ((distance_std),(reflection_std))
                 lidarscan /= std
 
                 # reshape the normalized lidarscan to [dis,ref,dis,ref...]
                 distance_data = lidarscan[0, :]
                 reflectance_data = lidarscan[1, :]
-                lidarscan = np.reshape(np.dstack((distance_data, reflectance_data)), [256000])
-                lidarscan = tf.convert_to_tensor(lidarscan)
+                lidarscan = tf.reshape(tf.stack([distance_data, reflectance_data], axis=1), (256000,))
 
                 lidarscans.append(lidarscan)
                 coordinates.append(coordinate)
@@ -127,7 +132,7 @@ def main(args):
 
         lidarscan_batch, labels_batch, coordinates_batch = tf.train.batch_join(
             lidarscans_and_labels_and_coordinates, batch_size=batch_size_placeholder,  # ！！！！！batch size??
-            shapes=[(256000), (), (2)], enqueue_many=True,
+            shapes=[(256000,), (), (2,)], enqueue_many=True,
             capacity=4 * nrof_preprocess_threads * args.batch_size,
             allow_smaller_final_batch=True)
         lidarscan_batch = tf.identity(lidarscan_batch, 'lidarscan_batch')
@@ -139,9 +144,9 @@ def main(args):
         prelogits, reg_term = network.inference(lidarscan_batch, args.keep_probability,
                                                 is_training=is_training_placeholder,
                                                 bottleneck_layer_size=args.embedding_size,
-                                                weight_decay=args.weight_decay)
+                                                )  # weight_decay=args.weight_decay deleted
 
-        embeddings = tf.nn.l2_normalize(prelogits, 1e-10, name='embeddings')
+        embeddings = tf.nn.l2_normalize(prelogits, 1, 1e-10, name='embeddings')
         # Split embeddings into anchor, positive and negative and calculate triplet loss
         anchor, positive, negative = tf.unstack(tf.reshape(embeddings, [-1, 3, args.embedding_size]), 3, 1)
         triplet_loss = my_net.triplet_loss(anchor, positive, negative, args.alpha)
@@ -150,8 +155,9 @@ def main(args):
 
         # Calculate the total losses
         # regularization_losses = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)  # 具体怎么得到还没写！
-        regularization_losses = reg_term  # temporary used for simple network
-        total_loss = tf.add_n([triplet_loss] + regularization_losses, name='total_loss')
+        regularization_losses = tf.convert_to_tensor(reg_term)  # temporary used for simple network
+        total_loss = tf.add_n([triplet_loss] + [regularization_losses],
+                              name='total_loss')  # Here the reg_loss is a value, so turn it to a list
 
         # Build a Graph that trains the model with one batch of examples and updates the model parameters
         train_op = my_net.train(total_loss, global_step, args.optimizer,
@@ -162,10 +168,6 @@ def main(args):
 
         # Build the summary operation based on the TF collection of Summaries.
         summary_op = tf.summary.merge_all()  # not used
-
-        # Start running operations on the Graph.
-        gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=args.gpu_memory_fraction)  # GPU的设置 还没看
-        sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options))
 
         # Initialize variables
         sess.run(tf.global_variables_initializer(), feed_dict={is_training_placeholder: True})
@@ -441,19 +443,19 @@ def parse_arguments(argv):
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--logs_base_dir', type=str,
-                        help='Directory where to write event logs.', default='~/logs/my_net')
+                        help='Directory where to write event logs.', default='../logs/my_net')
     parser.add_argument('--models_base_dir', type=str,
-                        help='Directory where to write trained models and checkpoints.', default='~/models/my_net')
+                        help='Directory where to write trained models and checkpoints.', default='../models/my_net')
     parser.add_argument('--gpu_memory_fraction', type=float,
                         help='Upper bound on the amount of GPU memory that will be used by the process.', default=1.0)
     parser.add_argument('--pretrained_model', type=str,
                         help='Load a pretrained model before training starts.')
     parser.add_argument('--data_dir', type=str,
                         help='Path to the data directory containing aligned face patches.',
-                        default='~/datasets/casia/casia_maxpy_mtcnnalign_182_160')
+                        default='../dataset/divided_data_0')
     parser.add_argument('--model_def', type=str,
                         help='Model definition. Points to a module containing the definition of the inference graph.',
-                        default='models.inception_resnet_v1')
+                        default='model')
     parser.add_argument('--max_nrof_epochs', type=int,
                         help='Number of epochs to run.', default=500)
     parser.add_argument('--batch_size', type=int,

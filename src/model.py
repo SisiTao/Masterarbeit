@@ -14,7 +14,7 @@ def add_layer(inputs, in_size, out_size, layername, keep_prob, activation_functi
     return outputs, weights
 
 
-def model_net(inputs, dropout_keep_prob=0.8, is_training=True, bottleneck_layer_size=128):
+def inference(inputs, dropout_keep_prob=0.8, is_training=True, bottleneck_layer_size=128):
     if is_training is False:
         dropout_keep_prob = 1.0
     net, weights_1 = add_layer(inputs, 256000, 10000, 'layer1', dropout_keep_prob, activation_function=tf.nn.relu)
