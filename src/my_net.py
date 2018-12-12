@@ -5,24 +5,32 @@ import tensorflow as tf
 def get_dataset(path):
     dataset = []
     path_exp = os.path.expanduser(path)
-    classes = [path for path in os.listdir(path_exp) if os.path.isdir(os.path.join(path_exp, path))]
-    classes.sort()
-    nrof_classes = len(classes)
-    for i in range(nrof_classes):
-        class_name = classes[i]
-        class_dir = os.path.join(path_exp, class_name)
-        lidarscans_and_globalegos = os.listdir(class_dir)
-        lidarscans=[name for name in lidarscans_and_globalegos if 'scan' in name]
-        lidarscan_paths = [os.path.join(class_dir, lid) for lid in lidarscans]
-        dataset.append(LidarClass(class_name, lidarscan_paths))
+    datasets_indices = [path for path in os.listdir(path_exp) if os.path.isdir(os.path.join(path_exp, path))]
+    nrof_subdatasets = len(datasets_indices)
+    classes_per_subdataset=[]
+    for i in range(nrof_subdatasets):
+        dataset_name = datasets_indices[i]
+        dataset_dir = os.path.join(path_exp, dataset_name)
+        classes = [path for path in os.listdir(dataset_dir) if os.path.isdir(os.path.join(dataset_dir, path))]
+        classes.sort()
+        nrof_classes = len(classes)
+        classes_per_subdataset.append(nrof_classes)
+        for j in range(nrof_classes):
+            class_name = classes[j]
+            class_dir = os.path.join(dataset_dir, class_name)
+            lidarscans_and_globalegos = os.listdir(class_dir)
+            lidarscans = [name for name in lidarscans_and_globalegos if 'scan' in name]
+            lidarscan_paths = [os.path.join(class_dir, lid) for lid in lidarscans]
+            dataset.append(LidarClass(dataset_name, class_name, lidarscan_paths))
 
-    return dataset
+    return dataset,nrof_subdatasets,classes_per_subdataset
 
 
 class LidarClass():
     """Stores the paths to lidarscans for a given class 其实没有用到class_name"""
 
-    def __init__(self, name, lidarscan_paths):
+    def __init__(self, dataset_name, name, lidarscan_paths):
+        self.dataset_name = dataset_name
         self.name = name
         self.lidarscan_paths = lidarscan_paths
 

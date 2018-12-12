@@ -1,3 +1,7 @@
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 import importlib
 from datetime import datetime
 import os
@@ -19,10 +23,10 @@ def main(args):
     # create log directory and model diectory
     subdir = datetime.strftime(datetime.now(), '%Y%m%d-%H%M%S')
     log_dir = os.path.join(os.path.expanduser(args.logs_base_dir), subdir)
-    if not os.path.isdir(log_dir):
+    if not os.path.isdir(log_dir):  # Create the log directory if it doesn't exist
         os.makedirs(log_dir)
     model_dir = os.path.join(os.path.expanduser(args.models_base_dir), subdir)
-    if not os.path.isdir(model_dir):
+    if not os.path.isdir(model_dir):  # Create the model directory if it doesn't exist
         os.makedirs(model_dir)
 
     # Write arguments to a text file
@@ -30,21 +34,29 @@ def main(args):
 
     # import dataset and divide it into trainset and validationset
     np.random.seed(seed=args.seed)
-    data_set = my_net.get_dataset(args.data_dir)  # Returns a list of LidarClass(class_name, lidarscan_paths)
-    train_set = data_set[10:len(data_set)]
-    validation_set = data_set[0:10]
-    # The first 10 classes are defined as validationset. Normally contains one dataset 50-90 classes.
 
-    # reform validation_set to pairs with issame labeled
+    data_set, nrof_subdatasets, classes_per_subdataset = my_net.get_dataset(args.data_dir)
+    # data_set: Returns a list of LidarClass(dataset_idx, class_name, lidarscan_paths)
+    # nrof_subdatasets: How many subdatasets in the dataset
+    # classes_per_subdataset: How many classes or places in each subdataset
+
+    validation_set = data_set[0:classes_per_subdataset[0]]
+    train_set = data_set[classes_per_subdataset[0]:len(data_set)]
+    classes_per_subdataset = classes_per_subdataset[1:nrof_subdatasets]
+    nrof_subdatasets -= 1
+    # The validation_set uses the lidarscans in the first subdataset
+
+    # prepare the positive and negative pairs and their labels of validation_set
     validation_paths = []
     actual_issame = []
+
     # pairs contain lidarscans from the same class/place: 4 pairs in each class (the first 4 lidarscans in one class)
     for i in range(len(validation_set)):
         validation_paths += (validation_set[i].lidarscan_paths[0], validation_set[i].lidarscan_paths[1])
         validation_paths += (validation_set[i].lidarscan_paths[1], validation_set[i].lidarscan_paths[2])
         validation_paths += (validation_set[i].lidarscan_paths[2], validation_set[i].lidarscan_paths[3])
-        validation_paths += (
-            validation_set[i].lidarscan_paths[3], validation_set[i].lidarscan_paths[0])  # 8 paths are appended
+        validation_paths += (validation_set[i].lidarscan_paths[3], validation_set[i].lidarscan_paths[0])
+        # 8 paths are appended
     actual_issame += [True] * (len(validation_set) * 4)
     # pairs contain lidarscans from the different classes/places: 4 pairs for each class
     for j in range(2):
@@ -154,10 +166,14 @@ def main(args):
         learning_rate = learning_rate_placehloder  # 源代码用了exponential_decay; the original code used exponential_decay
 
         # Calculate the total losses
-        # regularization_losses = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)  # 具体怎么得到还没写！
-        regularization_losses = tf.convert_to_tensor(reg_term)  # temporary used for simple network
-        total_loss = tf.add_n([triplet_loss] + [regularization_losses],
-                              name='total_loss')  # Here the reg_loss is a value, so turn it to a list
+        # for model.py
+        # regularization_losses = tf.convert_to_tensor(reg_term)  # temporary used for simple network
+        # total_loss = tf.add_n([triplet_loss] + [regularization_losses],
+        #                       name='total_loss')  # Here the reg_loss is a value, so turn it to a list
+
+        # for model_cnn.py
+        regularization_losses = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
+        total_loss = tf.add_n([triplet_loss] + regularization_losses, name='total_loss')
 
         # Build a Graph that trains the model with one batch of examples and updates the model parameters
         train_op = my_net.train(total_loss, global_step, args.optimizer,
@@ -189,7 +205,8 @@ def main(args):
                 step = sess.run(global_step, feed_dict=None)
                 epoch = step // args.epoch_size
                 # Train
-                train(args, args.learning_rate_schedule_file, epoch, train_set, sess, enqueue_op,
+                train(args, args.learning_rate_schedule_file, epoch, train_set, nrof_subdatasets,
+                      classes_per_subdataset, sess, enqueue_op,
                       lidarscan_paths_placeholder, labels_placeholder,
                       args.embedding_size, embeddings, coordinates_batch, labels_batch, batch_size_placeholder,
                       is_training_placeholder, learning_rate_placehloder, total_loss, train_op, global_step,
@@ -207,7 +224,8 @@ def main(args):
     return model_dir
 
 
-def train(args, learning_rate_schedule_file, epoch, dataset, sess, enqueue_op, lidarscan_paths_placeholder,
+def train(args, learning_rate_schedule_file, epoch, dataset, nrof_subdatasets, classes_per_subdataset, sess, enqueue_op,
+          lidarscan_paths_placeholder,
           labels_placeholder, embedding_size, embeddings, coordinates_batch, labels_batch, batch_size_placeholder,
           is_training_placeholder,
           learning_rate_placeholder, loss, train_op, global_step, summary_writer):
@@ -218,8 +236,9 @@ def train(args, learning_rate_schedule_file, epoch, dataset, sess, enqueue_op, l
     else:
         lr = my_net.get_learning_rate_from_file(learning_rate_schedule_file, epoch)
     while batch_number < args.epoch_size:
-        # Sample places randomly from the dataset
-        lidarscan_paths, num_per_class = sample_places(dataset, args.places_per_batch, args.lidarscans_per_place)
+        # Sample places(classes) randomly from the dataset (from the same subdataset)
+        lidarscan_paths, num_per_class = sample_places(dataset, nrof_subdatasets, classes_per_subdataset,
+                                                       args.places_per_batch, args.lidarscans_per_place)
 
         print('Running forward pass on sampled datascans: ', end='')
         start_time = time.time()
@@ -233,7 +252,7 @@ def train(args, learning_rate_schedule_file, epoch, dataset, sess, enqueue_op, l
                                            (-1, 3))  # why not directly use reshape
         sess.run(enqueue_op,
                  feed_dict={lidarscan_paths_placeholder: lidarscan_paths_array, labels_placeholder: labels_array})
-        coordinates_array = np.zeros((nrof_examples, embedding_size))
+        coordinates_array = np.zeros((nrof_examples, 2))
         nrof_batches = int(np.ceil(nrof_examples / args.batch_size))
         for i in range(nrof_batches):
             batch_size = min(nrof_examples - nrof_batches * args.batch_size, args.batch_size)
@@ -388,11 +407,25 @@ def write_arguments_to_file(args, filename):
             f.write('%s: %s\n' % (key, str(value)))
 
 
-def sample_places(dataset, places_per_batch, lidarscans_per_place):
+def sample_places(dataset, nrof_subdatasets, classes_per_subdataset, places_per_batch, lidarscans_per_place):
     nrof_lidarscans = places_per_batch * lidarscans_per_place
 
-    # Sample classes from the dataset
-    nrof_classes = len(dataset)
+    # Choose a random subdataset among the dataset
+    # Because the positive and negative pairs can only selected inside a common subdataset
+    dataset_idx_random = np.random.randint(nrof_subdatasets)
+    start_idx = 0
+    if dataset_idx_random == 0:
+        start_idx = 0
+    else:
+        for d in range(dataset_idx_random):
+            start_idx += classes_per_subdataset[d]
+
+    end_idx = start_idx + classes_per_subdataset[dataset_idx_random]
+    subdataset_random = dataset[start_idx:end_idx]
+
+    # Sample classes from the subdataset
+
+    nrof_classes = len(subdataset_random)
     class_indices = np.arange(nrof_classes)
     np.random.shuffle(class_indices)
 
@@ -403,13 +436,13 @@ def sample_places(dataset, places_per_batch, lidarscans_per_place):
     # Sample lidarscans from these classes until we have enough
     while len(lidarscan_paths) < nrof_lidarscans:
         class_index = class_indices[i]
-        nrof_lidarscans_in_class = len(dataset[class_index])
+        nrof_lidarscans_in_class = len(subdataset_random[class_index])
         lidarscan_indices = np.arange(nrof_lidarscans_in_class)
         np.random.shuffle(lidarscan_indices)
         nrof_lidarscans_from_class = min(lidarscans_per_place, nrof_lidarscans_in_class,
                                          nrof_lidarscans - len(lidarscan_paths))
         idx = lidarscan_indices[0:nrof_lidarscans_from_class]
-        lidarscan_paths_for_class = [dataset[class_index].lidarscan_paths[j] for j in idx]
+        lidarscan_paths_for_class = [subdataset_random[class_index].lidarscan_paths[j] for j in idx]
         lidarscan_paths += lidarscan_paths_for_class
         num_per_class.append(nrof_lidarscans_from_class)
         i += 1
