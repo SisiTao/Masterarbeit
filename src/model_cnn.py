@@ -26,11 +26,11 @@ def cnn_net(inputs,bottleneck_layer_size=128,dropout_keep_prob=0.8, is_training=
             # 16 x 16 x 128
             net = slim.conv2d(net, 128, 3, stride=[1, 2], scope='Conv2d_7_3x3')
             net = slim.dropout(net, keep_prob=dropout_keep_prob, is_training=is_training, scope='Dropout_7')
-            # 8 x 8 x 150
-            net = slim.conv2d(net, 150, 2, stride=2, scope='Conv2d_8_3x3')
-            # 150
+            # 8 x 8 x 256
+            net = slim.conv2d(net, 256, 2, stride=2, scope='Conv2d_8_3x3')
+            # 256
             net=slim.avg_pool2d(net,8,padding='VALID',scope='AvgPool_9_8x8')
-            net=slim.dropout(net,dropout_keep_prob,is_training=is_training,scope='Dropout_9')
+            net=slim.dropout(net,keep_prob=1.0,is_training=is_training,scope='Dropout_9')
             #128
             net=slim.fully_connected(net,bottleneck_layer_size,activation_fn=None,scope='Bottleneck',reuse=False)
     return net

@@ -101,20 +101,17 @@ def main(args):
                                               shared_name=None, name=None)
         enqueue_op = input_queue.enqueue_many([lidarscan_paths_placeholder, labels_placeholder])
 
-        # Start running operations on the Graph.
-        gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=args.gpu_memory_fraction)  # GPU的设置 还没看
-        sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options))
-
         nrof_preprocess_threads = 4
         lidarscans_and_labels_and_coordinates = []
         for _ in range(nrof_preprocess_threads):
-            filenames, label = input_queue.dequeue()  # shape: (3,) (3,) ?
+            filenames, labels = input_queue.dequeue()  # shape: (3,) (3,) ?
             lidarscans = []
             coordinates = []
             for filename in tf.unstack(filenames):
                 file_contents = tf.read_file(filename)
                 lidarscan = tf.decode_raw(file_contents, tf.float32)
-                lidarscan = tf.reshape(lidarscan, [2, 128000])
+                # lidarscan = tf.reshape(lidarscan, [2, 128000]) # for model.py 64 x 2000 = 128000
+                lidarscan = tf.reshape(lidarscan, [2, 32768])  # for model_cnn.py 64 x 512 = 32768
                 coordinate_filename = tf.strings.regex_replace(filename, 'velodyne_scan', 'global_ego_data')
                 coordinate = tf.decode_raw(tf.read_file(coordinate_filename), tf.float64)[16:18]
                 # easting and northing coordinate
@@ -127,24 +124,35 @@ def main(args):
                 std = tf.sqrt(var)  # ((distance_std),(reflection_std))
                 lidarscan /= std
 
-                # reshape the normalized lidarscan to [dis,ref,dis,ref...]
-                distance_data = lidarscan[0, :]
-                reflectance_data = lidarscan[1, :]
-                lidarscan = tf.reshape(tf.stack([distance_data, reflectance_data], axis=1), (256000,))
+                # # reshape the normalized lidarscan to [dis,ref,dis,ref...] for model.py
+                # distance_data = lidarscan[0]
+                # reflectance_data = lidarscan[1]
+                # lidarscan = tf.reshape(tf.stack([distance_data, reflectance_data], axis=1), (256000,))
+                # # Here the lidarscans are turned into one-d array with 256000 elements as the input of network.
 
+                # reshape the normalized lidarscan to (64, 512, 2) for model_cnn.py
+                distance_data = lidarscan[0]
+                reflectance_data = lidarscan[1]
+                lidarscan = tf.reshape(tf.stack([distance_data, reflectance_data], axis=1), (64, 512, 2))
                 lidarscans.append(lidarscan)
                 coordinates.append(coordinate)
-                # Here the lidarscans are turned into one-d array with 256000 elements as the input of network.
-                # But in CNN the shape should be (height,width,channel) channel can be 2 if only distance and reflection
+                # But in CNN the shape should be (height,width,channel) channel can be 2 if only distance and reflectance
                 # are considerd as features. But the original width 2000 pix is not appropriate as input of CNN.
-                # How to turn it to 1024 or 2048 ?
-                # 这里进行data的大小剪裁，在卷积网络里应该要修改，比如宽度变为1024或2048，而不是2000
-            lidarscans_and_labels_and_coordinates.append([lidarscans, label, coordinates])
-        # 4*3 lidarscans,labels,coors after loop
+                # So the size of a lidarscan is reduced to 64 x 512 with scan_downsample.py
 
+            lidarscans_and_labels_and_coordinates.append([lidarscans, labels, coordinates])
+
+        # # for model.py
+        # lidarscan_batch, labels_batch, coordinates_batch = tf.train.batch_join(
+        #     lidarscans_and_labels_and_coordinates, batch_size=batch_size_placeholder,  # ！！！！！batch size??
+        #     shapes=[(256000,), (), (2,)], enqueue_many=True,
+        #     capacity=4 * nrof_preprocess_threads * args.batch_size,
+        #     allow_smaller_final_batch=True)
+
+        # for model_cnn.py
         lidarscan_batch, labels_batch, coordinates_batch = tf.train.batch_join(
             lidarscans_and_labels_and_coordinates, batch_size=batch_size_placeholder,  # ！！！！！batch size??
-            shapes=[(256000,), (), (2,)], enqueue_many=True,
+            shapes=[(64, 512, 2), (), (2,)], enqueue_many=True,
             capacity=4 * nrof_preprocess_threads * args.batch_size,
             allow_smaller_final_batch=True)
         lidarscan_batch = tf.identity(lidarscan_batch, 'lidarscan_batch')
@@ -153,11 +161,16 @@ def main(args):
         coordinates_batch = tf.identity(coordinates_batch, 'coordinates_batch')
 
         # Build the inference graph
-        prelogits, reg_term = network.inference(lidarscan_batch, args.keep_probability,
-                                                is_training=is_training_placeholder,
-                                                bottleneck_layer_size=args.embedding_size,
-                                                )  # weight_decay=args.weight_decay deleted
+        # # for model.py
+        # prelogits, reg_term = network.inference(lidarscan_batch, args.keep_probability,
+        #                                         is_training=is_training_placeholder,
+        #                                         bottleneck_layer_size=args.embedding_size
+        #                                         )  # weight_decay=args.weight_decay deleted
 
+        # for model_cnn.py
+        prelogits = network.inference(lidarscan_batch, args.keep_probability,
+                                      is_training=is_training_placeholder,
+                                      bottleneck_layer_size=args.embedding_size)
         embeddings = tf.nn.l2_normalize(prelogits, 1, 1e-10, name='embeddings')
         # Split embeddings into anchor, positive and negative and calculate triplet loss
         anchor, positive, negative = tf.unstack(tf.reshape(embeddings, [-1, 3, args.embedding_size]), 3, 1)
@@ -184,6 +197,10 @@ def main(args):
 
         # Build the summary operation based on the TF collection of Summaries.
         summary_op = tf.summary.merge_all()  # not used
+
+        # Start running operations on the Graph.
+        gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=args.gpu_memory_fraction)  # GPU的设置 还没看
+        sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options))
 
         # Initialize variables
         sess.run(tf.global_variables_initializer(), feed_dict={is_training_placeholder: True})
@@ -262,7 +279,7 @@ def train(args, learning_rate_schedule_file, epoch, dataset, nrof_subdatasets, c
             coordinates_array[lab, :] = coor  # sort the coordinates according to the label
         print('%.3f' % (time.time() - start_time))
 
-        # Select triplets based on distances
+        # Select triplets based on distances(coordinates)
         print('Selecting suitable triplets for training')
         start_time = time.time()
         triplets, nrof_random_negs, nrof_triplets = select_triplets(coordinates_array, num_per_class,
@@ -297,12 +314,11 @@ def train(args, learning_rate_schedule_file, epoch, dataset, nrof_subdatasets, c
             print('Epoch: [%d][%d/%d]\tTime %.3f\tLoss %2.3f' %
                   (epoch, batch_number + 1, args.epoch_size, duration, err))
             batch_number += 1
-            i += 1
             train_time += duration
             summary.value.add(tag='loss', simple_value=err)
 
         summary.value.add(tag='time/selection', simple_value=selection_time)
-        summary.value.add(tag='time/train', simple_value=selection_time)
+        summary.value.add(tag='time/train', simple_value=train_time)
         summary_writer.add_summary(summary, step)
     return step
 
@@ -327,12 +343,13 @@ def evaluate(sess, validation_paths, embeddings, enqueue_op, batch_size_placehol
         emb, lab = sess.run([embeddings, labels_batch], feed_dict={batch_size_placeholder: nrof_lidarscans,
                                                                    learning_rate_placeholder: 0.0,
                                                                    is_training_placeholder: False})  # 没有用到learning_rate啊？？？
-        emb_array[lab, :] = emb  # 省略了 label_check_array
+        emb_array[lab, :] = emb  # 省略了 label_check_array; ignored label_check_array
     print('%.3f' % (time.time() - start_time))
 
     # calculate accuracy (cross-validation: an array of accuracy of different folds )
-    accuracy = calculate_accuracy(emb_array, actual_issame, nrof_folds)
+    accuracy, best_thresholds = calculate_accuracy(emb_array, actual_issame, nrof_folds)
     print('Accuracy: %1.3f+-%1.3f' % (np.mean(accuracy), np.std(accuracy)))
+    print('Best thresholds: ', best_thresholds)
     evaluate_time = time.time() - start_time
     # Add accuracy to summary
     summary = tf.Summary()
@@ -359,6 +376,7 @@ def calculate_accuracy(embeddings, actual_issame, nrof_folds=10):
     accuracy = np.zeros((nrof_folds))
 
     k_fold = KFold(n_splits=nrof_folds, shuffle=True)
+    best_thresholds = []
     for fold_idx, (train_set, test_set) in enumerate(k_fold.split(indices)):
         # Find the best threshold for the fold using train_set
         accuracy_train = np.zeros((nrof_thresholds))
@@ -374,7 +392,8 @@ def calculate_accuracy(embeddings, actual_issame, nrof_folds=10):
         tp_test = np.sum(np.logical_and(predict_issame_test, actual_issame[test_set]))
         tn_test = np.sum(np.logical_and(np.logical_not(predict_issame_test), np.logical_not(actual_issame[test_set])))
         accuracy[fold_idx] = float(tp_test + tn_test) / distance[test_set].size
-    return accuracy
+        best_thresholds.append(thresholds[best_threshold_test])
+    return accuracy, best_thresholds
 
 
 def select_triplets(coordinates, nrof_lidarscans_per_place, lidarscan_paths, places_per_batch, alpha):
@@ -485,21 +504,21 @@ def parse_arguments(argv):
                         help='Load a pretrained model before training starts.')
     parser.add_argument('--data_dir', type=str,
                         help='Path to the data directory containing aligned face patches.',
-                        default='../dataset/divided_data_0')
+                        default='../dataset')
     parser.add_argument('--model_def', type=str,
                         help='Model definition. Points to a module containing the definition of the inference graph.',
-                        default='model')
+                        default='model_cnn')
     parser.add_argument('--max_nrof_epochs', type=int,
                         help='Number of epochs to run.', default=500)
-    parser.add_argument('--batch_size', type=int,
+    parser.add_argument('--batch_size', type=int, # TODO how much is appropriate
                         help='Number of lidar_scans to process in a batch.(used in evaluation)', default=50)
     # parser.add_argument('--image_size', type=int,
     #                   help='Image size (height, width) in pixels.', default=160)
     parser.add_argument('--places_per_batch', type=int,
-                        help='Number of places(or classes) per batch.', default=20)
+                        help='Number of places(or classes) per batch.', default=30)
     parser.add_argument('--lidarscans_per_place', type=int,
                         help='Number of lidarscans per place.', default=10)
-    parser.add_argument('--epoch_size', type=int,
+    parser.add_argument('--epoch_size', type=int, # TODO is the definition of help right?
                         help='Number of batches per epoch.', default=1000)
     parser.add_argument('--alpha', type=float,
                         help='Positive to negative triplet distance margin.', default=0.2)
@@ -512,7 +531,7 @@ def parse_arguments(argv):
     # parser.add_argument('--random_flip',
     #                     help='Performs random horizontal flipping of training images.', action='store_true')
     parser.add_argument('--keep_probability', type=float,
-                        help='Keep probability of dropout for the fully connected layer(s).', default=1.0)
+                        help='Keep probability of dropout for the convolutional layer(s).', default=0.8)
     parser.add_argument('--weight_decay', type=float,
                         help='L2 weight regularization.', default=0.0)
     parser.add_argument('--optimizer', type=str, choices=['ADAGRAD', 'ADADELTA', 'ADAM', 'RMSPROP', 'MOM'],
@@ -521,9 +540,9 @@ def parse_arguments(argv):
                         help='Initial learning rate. If set to a negative value a learning rate ' +
                              'schedule can be specified in the file "learning_rate_schedule.txt"', default=0.1)
     parser.add_argument('--learning_rate_decay_epochs', type=int,
-                        help='Number of epochs between learning rate decay.', default=100)
+                        help='Number of epochs between learning rate decay.(not used)', default=100)
     parser.add_argument('--learning_rate_decay_factor', type=float,
-                        help='Learning rate decay factor.', default=1.0)
+                        help='Learning rate decay factor.(not used)', default=1.0)
     parser.add_argument('--moving_average_decay', type=float,
                         help='Exponential decay for tracking of training parameters.', default=0.9999)
     parser.add_argument('--seed', type=int,
