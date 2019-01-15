@@ -40,10 +40,14 @@ def main(args):
     # nrof_subdatasets: How many subdatasets in the dataset
     # classes_per_subdataset: How many classes or places in each subdataset
 
-    validation_set = data_set[0:classes_per_subdataset[0]]
+    nrof_validation_classes = classes_per_subdataset[0]
+    if nrof_validation_classes % 3 != 0:
+        nrof_validation_classes = nrof_validation_classes - (nrof_validation_classes % 3)
+    validation_set = data_set[0:nrof_validation_classes]
     train_set = data_set[classes_per_subdataset[0]:len(data_set)]
     classes_per_subdataset = classes_per_subdataset[1:nrof_subdatasets]
     nrof_subdatasets -= 1
+
     # The validation_set uses the lidarscans in the first subdataset
 
     # prepare the positive and negative pairs and their labels of validation_set
@@ -168,13 +172,15 @@ def main(args):
         #                                         )  # weight_decay=args.weight_decay deleted
 
         # for model_cnn.py
-        prelogits = network.inference(lidarscan_batch, args.keep_probability,
+        prelogits = network.inference(lidarscan_batch, args.keep_probability,weight_decay=args.weight_decay,
                                       is_training=is_training_placeholder,
                                       bottleneck_layer_size=args.embedding_size)
+        prelogits = tf.reshape(prelogits, [-1, args.embedding_size])
         embeddings = tf.nn.l2_normalize(prelogits, 1, 1e-10, name='embeddings')
+
         # Split embeddings into anchor, positive and negative and calculate triplet loss
         anchor, positive, negative = tf.unstack(tf.reshape(embeddings, [-1, 3, args.embedding_size]), 3, 1)
-        triplet_loss = my_net.triplet_loss(anchor, positive, negative, args.alpha)
+        triplet_loss, pos_dist, neg_dist = my_net.triplet_loss(anchor, positive, negative, args.alpha)
 
         learning_rate = learning_rate_placehloder  # 源代码用了exponential_decay; the original code used exponential_decay
 
@@ -208,7 +214,8 @@ def main(args):
 
         summary_writer = tf.summary.FileWriter(log_dir, sess.graph)
         coord = tf.train.Coordinator()
-        tf.train.start_queue_runners(coord=coord, sess=sess)  # 启动所有graph里的queue runners。但是没找到？
+        tf.train.start_queue_runners(coord=coord, sess=sess)
+        # 启动所有graph里的queue runners。batch_join() added a queue runner to the Graph's QUEUE_RUNNER collection
 
         with sess.as_default():
 
@@ -227,10 +234,10 @@ def main(args):
                       lidarscan_paths_placeholder, labels_placeholder,
                       args.embedding_size, embeddings, coordinates_batch, labels_batch, batch_size_placeholder,
                       is_training_placeholder, learning_rate_placehloder, total_loss, train_op, global_step,
-                      summary_writer)
+                      summary_writer, pos_dist, neg_dist,regularization_losses)
                 # 源代码里的summary_op并没有被sess运行。但是summary_writer里有写sess
                 # Save variables and the metagraph if it doesn't exist already
-                save_variables_and_metagraph(sess, saver, summary_writer, model_dir, subdir, step)
+                save_variables_and_metagraph(sess, saver, model_dir, step, subdir, summary_writer)
 
                 # Evaluate based on validation_set
                 evaluate(sess, validation_paths, embeddings, enqueue_op, batch_size_placeholder,
@@ -245,7 +252,7 @@ def train(args, learning_rate_schedule_file, epoch, dataset, nrof_subdatasets, c
           lidarscan_paths_placeholder,
           labels_placeholder, embedding_size, embeddings, coordinates_batch, labels_batch, batch_size_placeholder,
           is_training_placeholder,
-          learning_rate_placeholder, loss, train_op, global_step, summary_writer):
+          learning_rate_placeholder, loss, train_op, global_step, summary_writer, pos_dist, neg_dist,reg_loss):
     batch_number = 0
 
     if args.learning_rate > 0.0:
@@ -257,13 +264,13 @@ def train(args, learning_rate_schedule_file, epoch, dataset, nrof_subdatasets, c
         lidarscan_paths, num_per_class = sample_places(dataset, nrof_subdatasets, classes_per_subdataset,
                                                        args.places_per_batch, args.lidarscans_per_place)
 
-        print('Running forward pass on sampled datascans: ', end='')
+        # Select triplets based on distances(coordinates)
+        print('Selecting suitable triplets for training:')
         start_time = time.time()
         nrof_examples = args.places_per_batch * args.lidarscans_per_place
         places_per_batch = len(num_per_class)
         # Here the number of places_per_batch is not equal to args.places_per_batch.
         # Because some lidarscans_per_place may less than args.lidarscans_per_place
-
         labels_array = np.reshape(np.arange(nrof_examples), (-1, 3))
         lidarscan_paths_array = np.reshape(np.expand_dims(np.array(lidarscan_paths), 1),
                                            (-1, 3))  # why not directly use reshape
@@ -271,24 +278,26 @@ def train(args, learning_rate_schedule_file, epoch, dataset, nrof_subdatasets, c
                  feed_dict={lidarscan_paths_placeholder: lidarscan_paths_array, labels_placeholder: labels_array})
         coordinates_array = np.zeros((nrof_examples, 2))
         nrof_batches = int(np.ceil(nrof_examples / args.batch_size))
+        nrof_coor = 0
         for i in range(nrof_batches):
-            batch_size = min(nrof_examples - nrof_batches * args.batch_size, args.batch_size)
-            coor, lab = sess.run([coordinates_batch, labels_batch],
+            batch_size = min(nrof_examples - i * args.batch_size, args.batch_size)
+            start_time=time.time()
+            coor, lab,emb = sess.run([coordinates_batch, labels_batch,embeddings],
                                  feed_dict={batch_size_placeholder: batch_size, is_training_placeholder: True,
                                             learning_rate_placeholder: lr})
+            forward_time=time.time()-start_time
+            print('forwardtime: ',forward_time)
             coordinates_array[lab, :] = coor  # sort the coordinates according to the label
-        print('%.3f' % (time.time() - start_time))
-
-        # Select triplets based on distances(coordinates)
-        print('Selecting suitable triplets for training')
-        start_time = time.time()
-        triplets, nrof_random_negs, nrof_triplets = select_triplets(coordinates_array, num_per_class,
-                                                                    lidarscan_paths, places_per_batch, args.alpha)
+            nrof_coor = nrof_coor + len(coor)
+        assert (nrof_coor == nrof_examples)
+        start_time=time.time()
+        triplets, nrof_triplets = select_triplets(coordinates_array, num_per_class,
+                                                  lidarscan_paths, places_per_batch, args.beta)
         selection_time = time.time() - start_time
-        print('(nrof_random_negs, nrof_triplets) = (%d, %d): time=%.3f seconds' % (
-            nrof_random_negs, nrof_triplets, selection_time))
+        print('(nrof_triplets) = (%d): time=%.3f seconds' % (nrof_triplets, selection_time))
 
         # Perform training on the selected triplets
+        print('Running forward pass on sampled datascans and Training: ')
         nrof_batches = int(np.ceil(nrof_triplets * 3 / args.batch_size))
         triplet_paths = list(itertools.chain(*triplets))
         nrof_examples = len(triplet_paths)
@@ -306,13 +315,17 @@ def train(args, learning_rate_schedule_file, epoch, dataset, nrof_subdatasets, c
             batch_size = min(nrof_examples - i * args.batch_size, args.batch_size)
             feed_dict = {batch_size_placeholder: batch_size, learning_rate_placeholder: lr,
                          is_training_placeholder: True}
-            err, _, step, emb, lab = sess.run([loss, train_op, global_step, embeddings, labels_batch],
-                                              feed_dict=feed_dict)  # dequeue batch_size examples for training
+            err,reg_err, _, step, emb, lab, pos_d, neg_d = sess.run(
+                [loss, reg_loss,train_op, global_step, embeddings, labels_batch, pos_dist, neg_dist],
+                feed_dict=feed_dict)  # dequeue batch_size examples for training
             emb_array[lab, :] = emb  # 这里其实用不上，因为train_op里已经计算了 not used
             # loss_array[i] = err # not used
             duration = time.time() - start_time
-            print('Epoch: [%d][%d/%d]\tTime %.3f\tLoss %2.3f' %
-                  (epoch, batch_number + 1, args.epoch_size, duration, err))
+            reg_err=sum(reg_err)
+            pos_d_mean=np.mean(pos_d)
+            neg_d_mean=np.mean(neg_d)
+            print('Epoch: [%d][%d/%d]\tTime %.3f\tLoss %2.3f\tReg_loss %2.3f\tpos_d_mean %2.3f\tneg_d_mean %2.3f' %
+                  (epoch, batch_number + 1, args.epoch_size, duration, err, reg_err,pos_d_mean,neg_d_mean))
             batch_number += 1
             train_time += duration
             summary.value.add(tag='loss', simple_value=err)
@@ -338,13 +351,16 @@ def evaluate(sess, validation_paths, embeddings, enqueue_op, batch_size_placehol
              feed_dict={lidarscan_paths_placeholder: lidarscan_paths_array, labels_placeholder: labels_array})
     emb_array = np.zeros((nrof_lidarscans, embedding_size))
     nrof_batches = int(np.ceil(nrof_lidarscans / batch_size))
+    label_check_array = np.zeros((nrof_lidarscans,))
     for i in range(nrof_batches):
         batch_size = min(nrof_lidarscans - i * batch_size, batch_size)
-        emb, lab = sess.run([embeddings, labels_batch], feed_dict={batch_size_placeholder: nrof_lidarscans,
+        emb, lab = sess.run([embeddings, labels_batch], feed_dict={batch_size_placeholder: batch_size,
                                                                    learning_rate_placeholder: 0.0,
                                                                    is_training_placeholder: False})  # 没有用到learning_rate啊？？？
-        emb_array[lab, :] = emb  # 省略了 label_check_array; ignored label_check_array
-    print('%.3f' % (time.time() - start_time))
+        emb_array[lab, :] = emb
+        label_check_array[lab] = 1
+    print('%.3f seconds' % (time.time() - start_time))
+    assert (np.all(label_check_array == 1))  # check all emb computed
 
     # calculate accuracy (cross-validation: an array of accuracy of different folds )
     accuracy, best_thresholds = calculate_accuracy(emb_array, actual_issame, nrof_folds)
@@ -371,8 +387,10 @@ def calculate_accuracy(embeddings, actual_issame, nrof_folds=10):
     thresholds = np.arange(0, 4, 0.01)  # 这个范围怎么确定的？how to determine this range?
     nrof_thresholds = len(thresholds)
 
-    distance = np.sum(np.square(np.subtract(embeddings1, embeddings2)), 1)
-    assert (len(distance) == len(actual_issame))
+    distances = np.sum(np.square(np.subtract(embeddings1, embeddings2)), 1)
+    avg_distance = np.mean(distances)
+    print('avg_distance= ', avg_distance)
+    assert (len(distances) == len(actual_issame))
     accuracy = np.zeros((nrof_folds))
 
     k_fold = KFold(n_splits=nrof_folds, shuffle=True)
@@ -381,22 +399,23 @@ def calculate_accuracy(embeddings, actual_issame, nrof_folds=10):
         # Find the best threshold for the fold using train_set
         accuracy_train = np.zeros((nrof_thresholds))
         for i, threshold in enumerate(thresholds):
-            predict_issame_train = np.less(distance[train_set], threshold)
+            predict_issame_train = np.less(distances[train_set], threshold)
+            actual_issame = np.asarray(actual_issame)
             tp_train = np.sum(np.logical_and(predict_issame_train, actual_issame[train_set]))
             tn_train = np.sum(
                 np.logical_and(np.logical_not(predict_issame_train), np.logical_not(actual_issame[train_set])))
-            accuracy_train[i] = float(tp_train + tn_train) / distance[train_set].size
+            accuracy_train[i] = float(tp_train + tn_train) / distances[train_set].size
         best_threshold_test = np.argmax(accuracy_train)
         # define two lidarscans with distance smaller than threshold as same
-        predict_issame_test = np.less(distance[test_set], thresholds[best_threshold_test])
+        predict_issame_test = np.less(distances[test_set], thresholds[best_threshold_test])
         tp_test = np.sum(np.logical_and(predict_issame_test, actual_issame[test_set]))
         tn_test = np.sum(np.logical_and(np.logical_not(predict_issame_test), np.logical_not(actual_issame[test_set])))
-        accuracy[fold_idx] = float(tp_test + tn_test) / distance[test_set].size
+        accuracy[fold_idx] = float(tp_test + tn_test) / distances[test_set].size
         best_thresholds.append(thresholds[best_threshold_test])
     return accuracy, best_thresholds
 
 
-def select_triplets(coordinates, nrof_lidarscans_per_place, lidarscan_paths, places_per_batch, alpha):
+def select_triplets(coordinates, nrof_lidarscans_per_place, lidarscan_paths, places_per_batch, beta):
     triplets = []
     start_idx = 0
 
@@ -404,12 +423,12 @@ def select_triplets(coordinates, nrof_lidarscans_per_place, lidarscan_paths, pla
         nrof_lidarscans = int(nrof_lidarscans_per_place[i])  # lidarscans around the same place
         for j in range(1, nrof_lidarscans):
             a_idx = start_idx + j - 1  # anchor
-            neg_dists = np.sqrt(np.sum(np.square(coordinates[a_idx] - coordinates), 1))
-            neg_dists[start_idx:start_idx + nrof_lidarscans] = np.NaN
+            neg_dists = np.sqrt(np.sum(np.square(coordinates[a_idx] - coordinates), 1))  # All distances to anchor
+            neg_dists[start_idx:start_idx + nrof_lidarscans] = np.NaN  # distances of the same class are set to NaN
             for pair in range(j, nrof_lidarscans):
                 p_idx = start_idx + pair  # all the other lidarscans in the same class are combined with anchor as positive pairs
                 pos_dist = np.sqrt(np.sum(np.square(coordinates[a_idx] - coordinates[p_idx])))
-                all_neg = np.where(neg_dists - pos_dist < alpha)[0]
+                all_neg = np.where(neg_dists - pos_dist < beta)[0]
                 # the negative distances should not be too big(hard negative, faster convergence
                 nrof_random_negs = all_neg.shape[0]
                 if nrof_random_negs > 0:
@@ -417,7 +436,7 @@ def select_triplets(coordinates, nrof_lidarscans_per_place, lidarscan_paths, pla
                     n_idx = all_neg[rnd_idx]
                     triplets.append((lidarscan_paths[a_idx], lidarscan_paths[p_idx], lidarscan_paths[n_idx]))
         start_idx += nrof_lidarscans
-    return triplets, nrof_random_negs, len(triplets)
+    return triplets, len(triplets)
 
 
 def write_arguments_to_file(args, filename):
@@ -446,9 +465,9 @@ def sample_places(dataset, nrof_subdatasets, classes_per_subdataset, places_per_
 
     nrof_classes = len(subdataset_random)
     class_indices = np.arange(nrof_classes)
-    np.random.shuffle(class_indices)
+    class_start_idx = np.random.randint(nrof_classes)
 
-    i = 0
+    i = class_start_idx
     lidarscan_paths = []
     num_per_class = []
 
@@ -465,6 +484,8 @@ def sample_places(dataset, nrof_subdatasets, classes_per_subdataset, places_per_
         lidarscan_paths += lidarscan_paths_for_class
         num_per_class.append(nrof_lidarscans_from_class)
         i += 1
+        if i == nrof_classes:
+            i = 0
 
     return lidarscan_paths, num_per_class
 
@@ -501,27 +522,32 @@ def parse_arguments(argv):
     parser.add_argument('--gpu_memory_fraction', type=float,
                         help='Upper bound on the amount of GPU memory that will be used by the process.', default=1.0)
     parser.add_argument('--pretrained_model', type=str,
-                        help='Load a pretrained model before training starts.')
+                        help='Load a pretrained model before training starts.',default = '../models/my_net/20190114-232817/model-20190114-232817.ckpt-1364')
+    # default = '../models/my_net/20190113-112404/model-20190113-112404.ckpt-0'
     parser.add_argument('--data_dir', type=str,
                         help='Path to the data directory containing aligned face patches.',
-                        default='../dataset')
+                        default='../divided_data_downsampled')
     parser.add_argument('--model_def', type=str,
                         help='Model definition. Points to a module containing the definition of the inference graph.',
                         default='model_cnn')
     parser.add_argument('--max_nrof_epochs', type=int,
-                        help='Number of epochs to run.', default=500)
-    parser.add_argument('--batch_size', type=int, # TODO how much is appropriate
-                        help='Number of lidar_scans to process in a batch.(used in evaluation)', default=50)
+                        help='Number of epochs to run.', default=150)
+    parser.add_argument('--batch_size', type=int,  # TODO how much is appropriate
+                        help='Number of lidar_scans to process in a batch.(used both in training and evaluation)',
+                        default=60)
     # parser.add_argument('--image_size', type=int,
     #                   help='Image size (height, width) in pixels.', default=160)
     parser.add_argument('--places_per_batch', type=int,
-                        help='Number of places(or classes) per batch.', default=30)
+                        help='Number of places(or classes) per batch.', default=20)
     parser.add_argument('--lidarscans_per_place', type=int,
-                        help='Number of lidarscans per place.', default=10)
-    parser.add_argument('--epoch_size', type=int, # TODO is the definition of help right?
-                        help='Number of batches per epoch.', default=1000)
+                        help='Number of lidarscans per place.', default=6)
+    parser.add_argument('--epoch_size', type=int,
+                        help='Number of batches per epoch.', default=10)
     parser.add_argument('--alpha', type=float,
-                        help='Positive to negative triplet distance margin.', default=0.2)
+                        help='Positive to negative triplet distance margin. ', default=3)
+    parser.add_argument('--beta', type=float,
+                        help='Positive to negative Coordinate distance margin. Negative distance should not be too large',
+                        default=60)
     parser.add_argument('--embedding_size', type=int,
                         help='Dimensionality of the embedding.', default=128)
     # parser.add_argument('--random_crop',
@@ -531,9 +557,10 @@ def parse_arguments(argv):
     # parser.add_argument('--random_flip',
     #                     help='Performs random horizontal flipping of training images.', action='store_true')
     parser.add_argument('--keep_probability', type=float,
-                        help='Keep probability of dropout for the convolutional layer(s).', default=0.8)
+                        help='Keep probability of dropout for the convolutional layer(s).Keep probability of dropout '
+                             'for the fully connected layer is set to 1',default=0.8)
     parser.add_argument('--weight_decay', type=float,
-                        help='L2 weight regularization.', default=0.0)
+                        help='L2 weight regularization.', default=0.000)
     parser.add_argument('--optimizer', type=str, choices=['ADAGRAD', 'ADADELTA', 'ADAM', 'RMSPROP', 'MOM'],
                         help='The optimization algorithm to use', default='ADAGRAD')
     parser.add_argument('--learning_rate', type=float,
@@ -551,7 +578,7 @@ def parse_arguments(argv):
                         help='File containing the learning rate schedule that is used when learning_rate is set to to -1.',
                         default='data/learning_rate_schedule.txt')
     parser.add_argument('--nrof_folds', type=int,
-                        help='Number of folds to use for cross validation. Mainly used for testing.', default=10)
+                        help='Number of folds to use for cross validation. Mainly used for testing.', default=5)
 
     return parser.parse_args(argv)
 

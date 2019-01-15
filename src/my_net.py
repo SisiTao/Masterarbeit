@@ -44,11 +44,11 @@ def triplet_loss(anchor, positive, negative, alpha):
         neg_dist = tf.reduce_sum(tf.square(tf.subtract(anchor, negative)), 1)
         basic_loss = tf.add(tf.subtract(pos_dist, neg_dist), alpha)
         loss = tf.reduce_mean(tf.maximum(basic_loss, 0.0), 0)
-    return loss
+    return loss,pos_dist,neg_dist
 
 
 def train(total_loss, global_step, optimizer, learning_rate, moving_average_decay, update_gradient_vars,
-          log_histograms=True):
+          log_histograms=False):
     # Generate moving averages of all losses and associated summaries.
     loss_averages_op = _add_loss_summaries(total_loss)
 
@@ -83,10 +83,10 @@ def train(total_loss, global_step, optimizer, learning_rate, moving_average_deca
             if grad is not None:
                 tf.summary.histogram(var.op.name + '/gradients', grad)
 
-    # Track the moving averages of all trainable variables.
+    # Track the moving averages of all trainable variables.???
     variable_averages = tf.train.ExponentialMovingAverage(
         moving_average_decay, global_step)
-    variables_averages_op = variable_averages.apply(tf.trainable_variables())  # not used ???????
+    variables_averages_op = variable_averages.apply(tf.trainable_variables())
 
     with tf.control_dependencies([apply_gradient_op, variables_averages_op]):
         train_op = tf.no_op(name='train')
