@@ -53,33 +53,43 @@ def main(args):
     # prepare the positive and negative pairs and their labels of validation_set
     validation_paths = []
     actual_issame = []
-
-    # pairs contain lidarscans from the same class/place: 4 pairs in each class (the first 4 lidarscans in one class)
+    lonly = 0
     for i in range(len(validation_set)):
-        validation_paths += (validation_set[i].lidarscan_paths[0], validation_set[i].lidarscan_paths[1])
-        validation_paths += (validation_set[i].lidarscan_paths[1], validation_set[i].lidarscan_paths[2])
-        validation_paths += (validation_set[i].lidarscan_paths[2], validation_set[i].lidarscan_paths[3])
-        validation_paths += (validation_set[i].lidarscan_paths[3], validation_set[i].lidarscan_paths[0])
-        # 8 paths are appended
-    actual_issame += [True] * (len(validation_set) * 4)
-    # pairs contain lidarscans from the different classes/places: 4 pairs for each class
-    for j in range(2):
-        idx_pairs = []
-        for class0_idx in range(len(validation_set)):  # class0: the anchor class
-            class1_idx = class2_idx = 0  # class1 and class2: the negative class
-            while class1_idx == class2_idx or class1_idx == class0_idx or class2_idx == class0_idx:  # avoid the same class
-                class1_idx, class2_idx = np.random.randint(len(validation_set), size=2)
-                if (class1_idx, class0_idx) in idx_pairs:  # avoid repeatment
-                    class1_idx = np.random.randint(len(validation_set))
-                if (class2_idx, class0_idx) in idx_pairs:
-                    class2_idx = np.random.randint(len(validation_set))
-            validation_paths += (
-                validation_set[class0_idx].lidarscan_paths[j], validation_set[class1_idx].lidarscan_paths[j])
-            validation_paths += (
-                validation_set[class0_idx].lidarscan_paths[j], validation_set[class2_idx].lidarscan_paths[j])
-            # take the first(j=0) or second(j=1) lidarscans of each class as anchor-negative pairs
-            idx_pairs += ((class0_idx, class1_idx), (class0_idx, class2_idx))
-    actual_issame += [False] * (len(validation_set) * 4)
+        class_kern_anchor = validation_set[i].name.split('_')
+        class_kern_anchor = [int(c) for c in class_kern_anchor]
+        if i == (len(validation_set) - 1):
+            start_idx = 0
+            end_idx = len(validation_set)
+        else:
+            start_idx = i + 1
+            end_idx = i
+        j = start_idx
+
+        for _ in range(len(validation_set) - 1):
+            class_kern_neg = validation_set[j].name.split('_')
+            class_kern_neg = [int(c) for c in class_kern_neg]
+            distance_between_classes = np.sqrt(np.sum(np.square(np.subtract(class_kern_anchor, class_kern_neg))))
+            if distance_between_classes < 60:
+                # pairs contain lidarscans from the neighbor classes/places: 4 pairs for each class
+                validation_paths += (validation_set[i].lidarscan_paths[0], validation_set[j].lidarscan_paths[0])
+                validation_paths += (validation_set[i].lidarscan_paths[1], validation_set[j].lidarscan_paths[1])
+                validation_paths += (validation_set[i].lidarscan_paths[2], validation_set[j].lidarscan_paths[2])
+                validation_paths += (validation_set[i].lidarscan_paths[3], validation_set[j].lidarscan_paths[3])
+                actual_issame += [False] * 4
+                # pairs contain lidarscans from the same class/place: 4 pairs in each class (the first 4 lidarscans in one class)
+                validation_paths += (validation_set[i].lidarscan_paths[0], validation_set[i].lidarscan_paths[1])
+                validation_paths += (validation_set[i].lidarscan_paths[1], validation_set[i].lidarscan_paths[2])
+                validation_paths += (validation_set[i].lidarscan_paths[2], validation_set[i].lidarscan_paths[3])
+                validation_paths += (validation_set[i].lidarscan_paths[3], validation_set[i].lidarscan_paths[0])
+                actual_issame += [True] * 4
+                break
+            j += 1
+            if j == len(validation_set):
+                j = 0
+            if j == end_idx:
+                lonly=lonly+1
+                print(lonly,'  A lonly point/class that has no neighbor',validation_set[j].name)
+
     assert (len(validation_paths) == (len(actual_issame) * 2))
 
     print('Model directory: %s' % model_dir)
@@ -172,7 +182,7 @@ def main(args):
         #                                         )  # weight_decay=args.weight_decay deleted
 
         # for model_cnn.py
-        prelogits = network.inference(lidarscan_batch, args.keep_probability,weight_decay=args.weight_decay,
+        prelogits = network.inference(lidarscan_batch, args.keep_probability, weight_decay=args.weight_decay,
                                       is_training=is_training_placeholder,
                                       bottleneck_layer_size=args.embedding_size)
         prelogits = tf.reshape(prelogits, [-1, args.embedding_size])
@@ -234,7 +244,7 @@ def main(args):
                       lidarscan_paths_placeholder, labels_placeholder,
                       args.embedding_size, embeddings, coordinates_batch, labels_batch, batch_size_placeholder,
                       is_training_placeholder, learning_rate_placehloder, total_loss, train_op, global_step,
-                      summary_writer, pos_dist, neg_dist,regularization_losses)
+                      summary_writer, pos_dist, neg_dist, regularization_losses)
                 # 源代码里的summary_op并没有被sess运行。但是summary_writer里有写sess
                 # Save variables and the metagraph if it doesn't exist already
                 save_variables_and_metagraph(sess, saver, model_dir, step, subdir, summary_writer)
@@ -252,7 +262,7 @@ def train(args, learning_rate_schedule_file, epoch, dataset, nrof_subdatasets, c
           lidarscan_paths_placeholder,
           labels_placeholder, embedding_size, embeddings, coordinates_batch, labels_batch, batch_size_placeholder,
           is_training_placeholder,
-          learning_rate_placeholder, loss, train_op, global_step, summary_writer, pos_dist, neg_dist,reg_loss):
+          learning_rate_placeholder, loss, train_op, global_step, summary_writer, pos_dist, neg_dist, reg_loss):
     batch_number = 0
 
     if args.learning_rate > 0.0:
@@ -281,16 +291,14 @@ def train(args, learning_rate_schedule_file, epoch, dataset, nrof_subdatasets, c
         nrof_coor = 0
         for i in range(nrof_batches):
             batch_size = min(nrof_examples - i * args.batch_size, args.batch_size)
-            start_time=time.time()
-            coor, lab,emb = sess.run([coordinates_batch, labels_batch,embeddings],
-                                 feed_dict={batch_size_placeholder: batch_size, is_training_placeholder: True,
-                                            learning_rate_placeholder: lr})
-            forward_time=time.time()-start_time
-            print('forwardtime: ',forward_time)
+
+            coor, lab, emb = sess.run([coordinates_batch, labels_batch, embeddings],
+                                      feed_dict={batch_size_placeholder: batch_size, is_training_placeholder: True,
+                                                 learning_rate_placeholder: lr})
             coordinates_array[lab, :] = coor  # sort the coordinates according to the label
             nrof_coor = nrof_coor + len(coor)
         assert (nrof_coor == nrof_examples)
-        start_time=time.time()
+        start_time = time.time()
         triplets, nrof_triplets = select_triplets(coordinates_array, num_per_class,
                                                   lidarscan_paths, places_per_batch, args.beta)
         selection_time = time.time() - start_time
@@ -315,17 +323,17 @@ def train(args, learning_rate_schedule_file, epoch, dataset, nrof_subdatasets, c
             batch_size = min(nrof_examples - i * args.batch_size, args.batch_size)
             feed_dict = {batch_size_placeholder: batch_size, learning_rate_placeholder: lr,
                          is_training_placeholder: True}
-            err,reg_err, _, step, emb, lab, pos_d, neg_d = sess.run(
-                [loss, reg_loss,train_op, global_step, embeddings, labels_batch, pos_dist, neg_dist],
+            err, reg_err, _, step, emb, lab, pos_d, neg_d = sess.run(
+                [loss, reg_loss, train_op, global_step, embeddings, labels_batch, pos_dist, neg_dist],
                 feed_dict=feed_dict)  # dequeue batch_size examples for training
             emb_array[lab, :] = emb  # 这里其实用不上，因为train_op里已经计算了 not used
             # loss_array[i] = err # not used
             duration = time.time() - start_time
-            reg_err=sum(reg_err)
-            pos_d_mean=np.mean(pos_d)
-            neg_d_mean=np.mean(neg_d)
+            reg_err = sum(reg_err)
+            pos_d_mean = np.mean(pos_d)
+            neg_d_mean = np.mean(neg_d)
             print('Epoch: [%d][%d/%d]\tTime %.3f\tLoss %2.3f\tReg_loss %2.3f\tpos_d_mean %2.3f\tneg_d_mean %2.3f' %
-                  (epoch, batch_number + 1, args.epoch_size, duration, err, reg_err,pos_d_mean,neg_d_mean))
+                  (epoch, batch_number + 1, args.epoch_size, duration, err, reg_err, pos_d_mean, neg_d_mean))
             batch_number += 1
             train_time += duration
             summary.value.add(tag='loss', simple_value=err)
@@ -522,11 +530,11 @@ def parse_arguments(argv):
     parser.add_argument('--gpu_memory_fraction', type=float,
                         help='Upper bound on the amount of GPU memory that will be used by the process.', default=1.0)
     parser.add_argument('--pretrained_model', type=str,
-                        help='Load a pretrained model before training starts.',default = '../models/my_net/20190114-232817/model-20190114-232817.ckpt-1364')
+                        help='Load a pretrained model before training starts.')
     # default = '../models/my_net/20190113-112404/model-20190113-112404.ckpt-0'
     parser.add_argument('--data_dir', type=str,
                         help='Path to the data directory containing aligned face patches.',
-                        default='../divided_data_downsampled')
+                        default='C:/Users/Stadtpilot/Desktop/datasets/divided_data_downsampled')
     parser.add_argument('--model_def', type=str,
                         help='Model definition. Points to a module containing the definition of the inference graph.',
                         default='model_cnn')
@@ -558,7 +566,7 @@ def parse_arguments(argv):
     #                     help='Performs random horizontal flipping of training images.', action='store_true')
     parser.add_argument('--keep_probability', type=float,
                         help='Keep probability of dropout for the convolutional layer(s).Keep probability of dropout '
-                             'for the fully connected layer is set to 1',default=0.8)
+                             'for the fully connected layer is set to 1', default=0.8)
     parser.add_argument('--weight_decay', type=float,
                         help='L2 weight regularization.', default=0.000)
     parser.add_argument('--optimizer', type=str, choices=['ADAGRAD', 'ADADELTA', 'ADAM', 'RMSPROP', 'MOM'],
