@@ -11,6 +11,7 @@ import my_net
 import tensorflow as tf
 from tensorflow.python.ops import data_flow_ops
 import time
+import itertools
 import argparse
 import sys
 
@@ -33,14 +34,16 @@ def main(args):
     # import dataset and divide it into trainset and validationset
     np.random.seed(seed=args.seed)
 
-    pairs_paths, pairs_dists = get_paths_pairs(args.data_dir, args.pairs_file)
+    pairs_paths, pairs_dists, pairs_angles = get_paths_pairs(args.data_dir, args.pairs_file)
     # paths_pairs: Returns a list of shuffled paths_pairs shape(?,2)
 
-    nrof_validation_pairs = args.nrof_validation_pairs
+    nrof_validation_pairs = 64
     validation_set = pairs_paths[0:nrof_validation_pairs]
     validation_dist = pairs_dists[0:nrof_validation_pairs]
+    validation_angle = pairs_angles[0:nrof_validation_pairs]
     train_set = pairs_paths[nrof_validation_pairs:len(pairs_paths)]
     train_dist = pairs_dists[nrof_validation_pairs:len(pairs_paths)]
+    train_angle = pairs_angles[nrof_validation_pairs:len(pairs_paths)]
 
     print('Model directory: %s' % model_dir)
     print('Log directory: %s' % log_dir)
@@ -57,6 +60,7 @@ def main(args):
         is_training_placeholder = tf.placeholder(tf.bool, name='is_trainning')
         lidarscan_paths_placeholder = tf.placeholder(tf.string, shape=(None, 2), name='lidarscan_paths')
         dists_placeholder = tf.placeholder(tf.float32, shape=(None, 2), name='distances')
+        angles_placeholder = tf.placeholder(tf.float32, shape=(None, 2), name='angles')
         labels_placeholder = tf.placeholder(tf.int64, shape=(None, 2), name='labels')
 
         # queue operation
@@ -64,12 +68,13 @@ def main(args):
                                               dtypes=[tf.string, tf.int64, tf.float32],
                                               shapes=[(2,), (2,), (2,)],
                                               shared_name=None, name=None)
-        enqueue_op = input_queue.enqueue_many([lidarscan_paths_placeholder, labels_placeholder, dists_placeholder])
+        enqueue_op = input_queue.enqueue_many(
+            [lidarscan_paths_placeholder, labels_placeholder, dists_placeholder, angles_placeholder])
 
         nrof_preprocess_threads = 4
-        lidarscans_and_labels_and_distance = []
+        lidarscans_labels_distance_angle = []
         for _ in range(nrof_preprocess_threads):
-            filenames, labels, dist = input_queue.dequeue()  # shape: (2,) (2,) (2)?
+            filenames, labels, dist, angle = input_queue.dequeue()  # shape: (2,) (2,) (2),(2)?
             lidarscans = []
 
             for filename in tf.unstack(filenames):
@@ -95,10 +100,10 @@ def main(args):
                 # are considerd as features. But the original width 2000 pix is not appropriate as input of CNN.
                 # So the size of a lidarscan is reduced to 64 x 512 with scan_downsample.py
 
-            lidarscans_and_labels_and_distance.append([lidarscans, labels, dist])
+            lidarscans_labels_distance_angle.append([lidarscans, labels, dist, angle])
 
-        lidarscan_batch, labels_batch, dist_batch = tf.train.batch_join(
-            lidarscans_and_labels_and_distance, batch_size=batch_size_placeholder,  # ！！！！！batch size??
+        lidarscan_batch, labels_batch, dist_batch, angle_batch = tf.train.batch_join(
+            lidarscans_labels_distance_angle, batch_size=batch_size_placeholder,  # ！！！！！batch size??
             shapes=[(64, 512, 2), (), ()], enqueue_many=True,
             capacity=8 * nrof_preprocess_threads * args.pairs_per_batch,
             allow_smaller_final_batch=True)
@@ -106,6 +111,7 @@ def main(args):
         lidarscan_batch = tf.identity(lidarscan_batch, 'input')
         labels_batch = tf.identity(labels_batch, 'labels_batch')
         dist_batch = tf.identity(dist_batch, 'distance_batch')
+        angle_batch = tf.identity(angle_batch, 'angle_batch')
 
         # Build the inference graph
         prelogits = network.inference(lidarscan_batch, args.keep_probability, weight_decay=args.weight_decay,
@@ -115,15 +121,24 @@ def main(args):
         embeddings = prelogits
         # embeddings = tf.nn.l2_normalize(prelogits, 1, 1e-10, name='embeddings')
         # Split embeddings into anchor, positive and negative and calculate triplet loss
-        embedding1, embedding2 = tf.unstack(tf.reshape(embeddings, [-1, 2, args.embedding_size]), 2, 1)
-        dist_prediction = tf.sqrt(tf.reduce_sum(tf.square(tf.subtract(embedding1, embedding2)), 1))
+        # embedding1, embedding2 = tf.unstack(tf.reshape(embeddings, [-1, 2, args.embedding_size]), 2, 1)
+        embedding_concat = tf.reshape(embeddings, [-1, args.embedding_size * 2])
+
+        prediction = network.fully_connected(embedding_concat, args.keep_probability, args.embedding_size * 2,
+                                             is_training=is_training_placeholder, weight_decay=args.weight_decay)
+        prediction = tf.reshape(prediction, [-1])
+        dist_prediction = prediction[0::2]
+        angle_prediction = prediction[1::2]
+
         dist_batch, _ = tf.unstack(tf.reshape(dist_batch, [-1, 2]), 2, 1)
         distance_loss = tf.reduce_mean(tf.sqrt(tf.square(tf.subtract(dist_prediction, dist_batch))), 0)
+        angle_batch, _ = tf.unstack(tf.reshape(angle_batch, [-1, 2]), 2, 1)
+        angle_loss = tf.reduce_mean(tf.sqrt(tf.square(tf.subtract(angle_prediction, angle_batch))), 0)
         learning_rate = learning_rate_placehloder  # 源代码用了exponential_decay; the original code used exponential_decay
 
         # Calculate the total losses
         regularization_losses = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
-        total_loss = tf.add_n([distance_loss] + regularization_losses, name='total_loss')
+        total_loss = tf.add_n([distance_loss] + [angle_loss * args.gamma] + regularization_losses, name='total_loss')
 
         # Build a Graph that trains the model with one batch of examples and updates the model parameters
         train_op = my_net.train(total_loss, global_step, args.optimizer,
@@ -160,48 +175,60 @@ def main(args):
                 step = sess.run(global_step, feed_dict=None)
                 epoch = step // args.epoch_size
                 # Train
-                train(args, args.learning_rate_schedule_file, epoch, train_set, train_dist, sess, enqueue_op,
-                      lidarscan_paths_placeholder, labels_placeholder, dists_placeholder,
+                train(args, args.learning_rate_schedule_file, epoch, train_set, train_dist, train_angle, sess,
+                      enqueue_op,
+                      lidarscan_paths_placeholder, labels_placeholder, dists_placeholder, angles_placeholder,
                       args.embedding_size, embeddings, labels_batch, batch_size_placeholder,
-                      is_training_placeholder, learning_rate_placehloder, total_loss, train_op, global_step,
+                      is_training_placeholder, learning_rate_placehloder, total_loss, distance_loss, angle_loss,
+                      train_op, global_step,
                       summary_writer, regularization_losses)
                 # 源代码里的summary_op并没有被sess运行。但是summary_writer里有写sess
                 # Save variables and the metagraph if it doesn't exist already
                 save_variables_and_metagraph(sess, saver, model_dir, step, subdir, summary_writer)
 
                 # Evaluate based on validation_set
-                evaluate(args, sess, validation_set, validation_dist, embeddings, enqueue_op, batch_size_placeholder,
-                         lidarscan_paths_placeholder, labels_placeholder, dists_placeholder, args.embedding_size,
+                evaluate(args, sess, validation_set, validation_dist, validation_angle, embeddings, enqueue_op,
+                         batch_size_placeholder,
+                         lidarscan_paths_placeholder, labels_placeholder, dists_placeholder, angles_placeholder,
+                         args.embedding_size,
                          labels_batch, learning_rate_placehloder, is_training_placeholder, summary_writer, step,
-                         log_dir, distance_loss)
+                         log_dir, distance_loss, angle_loss)
 
     return model_dir
 
 
-def train(args, learning_rate_schedule_file, epoch, dataset, dataset_dist, sess, enqueue_op,
-          lidarscan_paths_placeholder, labels_placeholder, dists_placeholder, embedding_size, embeddings,
-          labels_batch, batch_size_placeholder, is_training_placeholder, learning_rate_placeholder,
-          loss, train_op, global_step, summary_writer, reg_loss):
+def train(args, learning_rate_schedule_file, epoch, dataset, dataset_dist, dataset_angle, sess, enqueue_op,
+          lidarscan_paths_placeholder, labels_placeholder, dists_placeholder, angles_placeholder, embedding_size,
+          embeddings, labels_batch, batch_size_placeholder, is_training_placeholder, learning_rate_placeholder,
+          loss, distance_loss, angle_loss, train_op, global_step, summary_writer, reg_loss):
     if args.learning_rate > 0.0:
         lr = args.learning_rate
     else:
         lr = my_net.get_learning_rate_from_file(learning_rate_schedule_file, epoch)
 
     # Sample pairs randomly from the dataset
-    lidarscan_paths, dists = sample_pairs(dataset, dataset_dist, args.pairs_per_batch, args.epoch_size)
+    lidarscan_paths, dists, angles = sample_pairs(dataset, dataset_dist, dataset_angle, args.pairs_per_batch,
+                                                  args.epoch_size)
     lidarscan_paths_array = np.array(lidarscan_paths)
     dists_list = []
+    angles_list = []
     for dist in dists:
         dists_list.append(dist)
         dists_list.append(dist)
+    for angle in angles:
+        angles_list.append(angle)
+        angles_list.append(angle)
+
     dists_array = np.reshape(np.array(dists_list), (-1, 2))
+    angles_array = np.reshape(np.array(angles_list), (-1, 2))
     assert (lidarscan_paths_array.shape[1] == 2)
     nrof_examples = args.pairs_per_batch * args.epoch_size * 2
     labels_array = np.reshape(np.arange(nrof_examples), (-1, 2))
     sess.run(enqueue_op,
              feed_dict={lidarscan_paths_placeholder: lidarscan_paths_array,
                         labels_placeholder: labels_array,
-                        dists_placeholder: dists_array})
+                        dists_placeholder: dists_array,
+                        angles_placeholder: angles_array})
 
     print('Running forward pass on sampled datascans and Training: ')
     train_time = 0
@@ -213,28 +240,31 @@ def train(args, learning_rate_schedule_file, epoch, dataset, dataset_dist, sess,
         start_time = time.time()
         feed_dict = {batch_size_placeholder: args.pairs_per_batch * 2, learning_rate_placeholder: lr,
                      is_training_placeholder: True}
-        err, reg_err, _, step, emb, lab = sess.run(
-            [loss, reg_loss, train_op, global_step, embeddings, labels_batch],
+        err, dist_err, angle_err, reg_err, _, step, emb, lab = sess.run(
+            [loss, distance_loss, angle_loss, reg_loss, train_op, global_step, embeddings, labels_batch],
             feed_dict=feed_dict)  # dequeue batch_size examples for training
-        if err==np.nan:
-            print(lidarscan_paths_array,batch_number+1) # check nan. sometimes loss suddenly becomes nan.
         emb_array[lab, :] = emb  # 这里其实用不上，因为train_op里已经计算了 not used
         # loss_array[i] = err # not used
         duration = time.time() - start_time
         reg_err = sum(reg_err)
-        print('Epoch: [%d][%d/%d]\tTime %.3f\tLoss %2.3f\tReg_loss %2.3f' %
-              (epoch, batch_number + 1, args.epoch_size, duration, err, reg_err))
+        print('Epoch: [%d][%d/%d]\tTime %.3f\tLoss %2.3f\tDist_loss %2.3f\tAngle_loss %2.3f\tReg_loss %2.3f' %
+              (epoch, batch_number + 1, args.epoch_size, duration, err, dist_err, angle_err, reg_err))
         train_time += duration
-        summary.value.add(tag='loss', simple_value=err)
+        summary.value.add(tag='loss/total_loss', simple_value=err)
+        summary.value.add(tag='loss/dist_loss', simple_value=dist_err)
+        summary.value.add(tag='loss/angle_loss', simple_value=angle_err)
 
     summary.value.add(tag='time/train', simple_value=train_time)
     summary_writer.add_summary(summary, step)
     return step
 
 
-def evaluate(args, sess, validation_set, validation_dist, embeddings, enqueue_op, batch_size_placeholder,
-             lidarscan_paths_placeholder, labels_placeholder, dists_placeholder, embedding_size, labels_batch,
-             learning_rate_placeholder, is_training_placeholder, summary_writer, step, log_dir, distance_loss):
+def evaluate(args, sess, validation_set, validation_dist, validation_angle, embeddings, enqueue_op,
+             batch_size_placeholder,
+             lidarscan_paths_placeholder, labels_placeholder, dists_placeholder, angles_placeholder, embedding_size,
+             labels_batch,
+             learning_rate_placeholder, is_training_placeholder, summary_writer, step, log_dir, distance_loss,
+             angle_loss):
     start_time = time.time()
 
     # Run forward pass to calculate embeddings
@@ -243,57 +273,74 @@ def evaluate(args, sess, validation_set, validation_dist, embeddings, enqueue_op
     lidarscan_paths_array = np.array(validation_set)
     labels_array = np.reshape(np.arange(nrof_lidarscans), (-1, 2))
     dists_list = []
+    angles_list = []
     for dist in validation_dist:
         dists_list.append(dist)
         dists_list.append(dist)
+    for angle in validation_angle:
+        angles_list.append(angle)
+        angles_list.append(angle)
     dists_array = np.reshape(np.array(dists_list), (-1, 2))
+    angles_array = np.reshape(np.array(angles_list), (-1, 2))
     assert (lidarscan_paths_array.shape[0] == labels_array.shape[0])
     assert (dists_array.shape[0] == labels_array.shape[0])
     sess.run(enqueue_op,
              feed_dict={lidarscan_paths_placeholder: lidarscan_paths_array,
                         labels_placeholder: labels_array,
-                        dists_placeholder: dists_array})
+                        dists_placeholder: dists_array,
+                        angles_placeholder: angles_array})
     emb_array = np.zeros((nrof_lidarscans, embedding_size))
     validation_loss = []
+    validation_dist_loss = []
+    validation_angle_loss = []
     batch_size = args.pairs_per_batch * 2
     nrof_batches = int(np.ceil(nrof_lidarscans / batch_size))
     label_check_array = np.zeros((nrof_lidarscans,))
     for i in range(nrof_batches):
         batch_size = min(nrof_lidarscans - i * batch_size, batch_size)
-        emb, lab, loss = sess.run([embeddings, labels_batch, distance_loss],
-                                  feed_dict={batch_size_placeholder: batch_size,
-                                             learning_rate_placeholder: 0.0,
-                                             is_training_placeholder: False})  # 没有用到learning_rate啊？？？
+        emb, lab, dist_err, angle_err = sess.run([embeddings, labels_batch, distance_loss, angle_loss],
+                                                 feed_dict={batch_size_placeholder: batch_size,
+                                                            learning_rate_placeholder: 0.0,
+                                                            is_training_placeholder: False})  # 没有用到learning_rate啊？？？
         emb_array[lab, :] = emb
-        validation_loss.append(loss)
+        validation_dist_loss.append(dist_err)
+        validation_angle_loss.append(angle_err)
+        validation_loss.append(dist_err + angle_err)
         label_check_array[lab] = 1
     assert (np.all(label_check_array == 1))  # check all emb computed
 
     evaluate_time = time.time() - start_time
     print('%.3f seconds' % (evaluate_time))
 
-    print('Validation losses: ',validation_loss)
+    print('Validation losses: ', validation_loss)
+    validation_dist_loss = np.mean(validation_dist_loss)
+    validation_angle_loss = np.mean(validation_angle_loss)
     validation_loss = np.mean(validation_loss)
-    print('Average validation loss: %3.3f' % (validation_loss))
+    print('Average validation loss: %2.3f\tdist_loss: %2.3f\tangle_loss: %2.3f' % (
+        validation_loss, validation_dist_loss, validation_angle_loss))
     # Add loss to summary
     summary = tf.Summary()
     summary.value.add(tag='evaluate/loss', simple_value=validation_loss)
+    summary.value.add(tag='evaluate/dist_loss', simple_value=validation_dist_loss)
+    summary.value.add(tag='evaluate/angle_loss', simple_value=validation_angle_loss)
     summary.value.add(tag='time/evaluate', simple_value=evaluate_time)
     summary_writer.add_summary(summary, step)
     with open(os.path.join(log_dir, 'evaluate_result.txt'), 'at') as f:
-        f.write('%d\t%.5f\n' % (step, validation_loss))
+        f.write('%d\t%.5f\t%.5f\t%.5f\n' % (step, validation_loss, validation_dist_loss, validation_angle_loss))
 
 
-def sample_pairs(dataset, dataset_dist, pairs_per_batch, epoch_size):
+def sample_pairs(dataset, dataset_dist, dataset_angle, pairs_per_batch, epoch_size):
     nrof_pairs = pairs_per_batch * epoch_size
     idx = np.arange(len(dataset))
     np.random.shuffle(idx)
     lidarscan_paths = []
     dists = []
+    angles = []
     for i in range(nrof_pairs):
         lidarscan_paths.append(dataset[idx[i]])
         dists.append(dataset_dist[idx[i]])
-    return lidarscan_paths, dists
+        angles.append(dataset_angle[idx[i]])
+    return lidarscan_paths, dists, angles
 
 
 def save_variables_and_metagraph(sess, saver, model_dir, step, model_name, summary_writer):
@@ -327,67 +374,71 @@ def write_arguments_to_file(args, filename):
 def get_paths_pairs(data_dir, pairs_file):
     pairs_paths = []
     pairs_dists = []
+    pairs_angles = []
     with open(pairs_file, 'r') as f:
         pairs = f.readlines()
         for i in range(len(pairs)):
             pair = pairs[i].split('#')[0:2]
             pair = [os.path.join(os.path.expanduser(data_dir), filename) for filename in pair]
             dist = float(pairs[i].split('#')[2])
+            angle = float(pairs[i].split('#')[3])
             pairs_paths.append(pair)
             pairs_dists.append(dist)
+            pairs_angles.append(angle)
     assert (len(pairs_paths) == len(pairs_dists))
     idx = np.arange(len(pairs_dists))
     np.random.shuffle(idx)
 
     pairs_paths_shuffle = [pairs_paths[i] for i in idx]
     pairs_dists_shuffle = [pairs_dists[i] for i in idx]
+    pairs_angles_shuffle = [pairs_angles[i] for i in idx]
 
-    return pairs_paths_shuffle, pairs_dists_shuffle
+    return pairs_paths_shuffle, pairs_dists_shuffle, pairs_angles_shuffle
 
 
 def parse_arguments(argv):
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--logs_base_dir', type=str,
-                        help='Directory where to write event logs.', default='D:/User/Sisi_Tao/Masterarbeit/logs/train_distance')
+                        help='Directory where to write event logs.', default='../logs/train_distance')
     parser.add_argument('--models_base_dir', type=str,
                         help='Directory where to write trained models and checkpoints.',
-                        default='D:/User/Sisi_Tao/Masterarbeit/models/train_distance')
+                        default='../models/train_distance')
     parser.add_argument('--gpu_memory_fraction', type=float,
                         help='Upper bound on the amount of GPU memory that will be used by the process.', default=1.0)
     parser.add_argument('--pretrained_model', type=str,
                         help='Load a pretrained model before training starts.',
-    default = '../models/train_distance/20190120-172149/model-20190120-172149.ckpt-750')
+                        default='../models/train_distance/20190120-172149/model-20190120-172149.ckpt-750')
     # default = '../models/my_net/20190113-112404/model-20190113-112404.ckpt-0'
     parser.add_argument('--data_dir', type=str,
                         help='Path to the data directory.',
-                        default='D:/Users/Sisi_Tao/downsampled_data')
+                        default='C:/Users/Stadtpilot/Desktop/datasets/downsampled_data')
     parser.add_argument('--pairs_file', type=str,
                         help='Path to the pairs_file.',
-                        default='D:/Users/Sisi_Tao/pairs_file.txt')
+                        default='C:/Users/Stadtpilot/Desktop/datasets/pairs_file.txt')
     parser.add_argument('--model_def', type=str,
                         help='Model definition. Points to a module containing the definition of the inference graph.',
-                        default='model_SqueezeNet')
-    parser.add_argument('--nrof_validation_pairs',type=int,
-                        help='Number of pairs for validation',default=4096)
+                        default='model_cnn')
     parser.add_argument('--max_nrof_epochs', type=int,
-                        help='Number of epochs to run.', default=1000)
+                        help='Number of epochs to run.', default=150)
     parser.add_argument('--pairs_per_batch', type=int,
-                        help='Number of pairs per batch.', default=128)
+                        help='Number of pairs per batch.', default=64)
     parser.add_argument('--epoch_size', type=int,
-                        help='Number of batches per epoch.', default=40)
+                        help='Number of batches per epoch.', default=5)
     parser.add_argument('--embedding_size', type=int,
-                        help='Dimensionality of the embedding.', default=200)
+                        help='Dimensionality of the embedding.', default=128)
     parser.add_argument('--keep_probability', type=float,
                         help='Keep probability of dropout for the convolutional layer(s).Keep probability of dropout '
-                             'for the fully connected layer is set to 1', default=0.7)
+                             'for the fully connected layer is set to 1', default=0.8)
+    parser.add_argument('--gamma', type=float,
+                        help='scale factor of angle loss.', default=0.5)
     parser.add_argument('--weight_decay', type=float,
-                        help='L2 weight regularization.', default=0.001)
+                        help='L2 weight regularization.', default=0.000)
     parser.add_argument('--optimizer', type=str, choices=['ADAGRAD', 'ADADELTA', 'ADAM', 'RMSPROP', 'MOM'],
                         help='The optimization algorithm to use', default='ADAGRAD')
     parser.add_argument('--learning_rate', type=float,
                         help='Initial learning rate. If set to a negative value a learning rate ' +
-                             'schedule can be specified in the file "learning_rate_schedule.txt"', default=0.05)
+                             'schedule can be specified in the file "learning_rate_schedule.txt"', default=0.1)
     parser.add_argument('--learning_rate_decay_epochs', type=int,
                         help='Number of epochs between learning rate decay.(not used)', default=100)
     parser.add_argument('--learning_rate_decay_factor', type=float,
