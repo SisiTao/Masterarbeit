@@ -1,12 +1,10 @@
 import os
 import numpy as np
-import shutil
 
-range_to_train = 55
-offset = 10
+range_to_train = 40
 
 data_dir = 'C:/Users/Stadtpilot/Desktop/datasets/downsampled_data'
-pairs_file = 'C:/Users/Stadtpilot/Desktop/datasets/pairs_file.txt'
+pairs_file = 'C:/Users/Stadtpilot/Desktop/datasets/pairs_file_40.txt'
 
 file_names = [name for name in sorted(os.listdir(data_dir)) if os.path.isfile(os.path.join(data_dir, name))]
 global_ego_list = [name for name in file_names if 'global_ego_data' in name]

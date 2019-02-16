@@ -34,13 +34,14 @@ def main(args):
     np.random.seed(seed=args.seed)
 
     pairs_paths, pairs_dists = get_paths_pairs(args.data_dir, args.pairs_file)
+    nrof_channel = args.nrof_channel
     # paths_pairs: Returns a list of shuffled paths_pairs shape(?,2)
-
+    map_pairs_paths, map_pairs_dists = get_paths_pairs(args.data_dir, args.map_pairs_file)
     nrof_validation_pairs = args.nrof_validation_pairs
-    validation_set = pairs_paths[0:nrof_validation_pairs]
-    validation_dist = pairs_dists[0:nrof_validation_pairs]
-    train_set = pairs_paths[nrof_validation_pairs:len(pairs_paths)]
-    train_dist = pairs_dists[nrof_validation_pairs:len(pairs_paths)]
+    validation_set = map_pairs_paths[0:nrof_validation_pairs]
+    validation_dist = map_pairs_dists[0:nrof_validation_pairs]
+    train_set = pairs_paths
+    train_dist = pairs_dists
 
     print('Model directory: %s' % model_dir)
     print('Log directory: %s' % log_dir)
@@ -75,7 +76,7 @@ def main(args):
             for filename in tf.unstack(filenames):
                 file_contents = tf.read_file(filename)
                 lidarscan = tf.decode_raw(file_contents, tf.float32)
-                lidarscan = tf.reshape(lidarscan, [2, 32768])  # for model_cnn.py 64 x 512 = 32768
+                lidarscan = tf.reshape(lidarscan, [nrof_channel, 32768])  # for model_cnn.py 64 x 512 = 32768
 
                 # per lidarscan normalization
                 mean = tf.reduce_mean(lidarscan, axis=1, keepdims=True)  # ((distance_mean),(reflection_mean))
@@ -85,10 +86,17 @@ def main(args):
                 std = tf.sqrt(var)  # ((distance_std),(reflection_std))
                 lidarscan /= std
 
-                # reshape the normalized lidarscan to (64, 512, 2) for model_cnn.py
-                distance_data = lidarscan[0]
-                reflectance_data = lidarscan[1]
-                lidarscan = tf.reshape(tf.stack([distance_data, reflectance_data], axis=1), (64, 512, 2))
+                # reshape the normalized lidarscan to (64, 512, 3) for model_cnn.py
+                if nrof_channel == 2:
+                    range_data = lidarscan[0]
+                    reflection_data = lidarscan[1]
+                    lidarscan = tf.reshape(tf.stack([range_data, reflection_data], axis=1), (64, 512, nrof_channel))
+                if nrof_channel == 3:
+                    range_data = lidarscan[0]
+                    reflection_data = lidarscan[1]
+                    forward_data = lidarscan[2]
+                    lidarscan = tf.reshape(tf.stack([range_data, reflection_data, forward_data], axis=1),
+                                           (64, 512, nrof_channel))
                 lidarscans.append(lidarscan)
 
                 # But in CNN the shape should be (height,width,channel) channel can be 2 if only distance and reflectance
@@ -99,7 +107,7 @@ def main(args):
 
         lidarscan_batch, labels_batch, dist_batch = tf.train.batch_join(
             lidarscans_and_labels_and_distance, batch_size=batch_size_placeholder,  # ！！！！！batch size??
-            shapes=[(64, 512, 2), (), ()], enqueue_many=True,
+            shapes=[(64, 512, nrof_channel), (), ()], enqueue_many=True,
             capacity=8 * nrof_preprocess_threads * args.pairs_per_batch,
             allow_smaller_final_batch=True)
         lidarscan_batch = tf.identity(lidarscan_batch, 'lidarscan_batch')
@@ -119,7 +127,9 @@ def main(args):
         dist_prediction = tf.sqrt(tf.reduce_sum(tf.square(tf.subtract(embedding1, embedding2)), 1))
         dist_batch, _ = tf.unstack(tf.reshape(dist_batch, [-1, 2]), 2, 1)
         distance_loss = tf.reduce_mean(tf.sqrt(tf.square(tf.subtract(dist_prediction, dist_batch))), 0)
-        learning_rate = learning_rate_placehloder  # 源代码用了exponential_decay; the original code used exponential_decay
+        learning_rate = tf.train.exponential_decay(learning_rate_placehloder, global_step,
+                                                   args.learning_rate_decay_epochs * args.epoch_size,
+                                                   args.learning_rate_decay_factor, staircase=True)
 
         # Calculate the total losses
         regularization_losses = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
@@ -131,9 +141,6 @@ def main(args):
 
         # Create a saver
         saver = tf.train.Saver(tf.trainable_variables(), max_to_keep=3)
-
-        # Build the summary operation based on the TF collection of Summaries.
-        summary_op = tf.summary.merge_all()  # not used
 
         # Start running operations on the Graph.
         gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=args.gpu_memory_fraction)  # GPU的设置 还没看
@@ -160,11 +167,13 @@ def main(args):
                 step = sess.run(global_step, feed_dict=None)
                 epoch = step // args.epoch_size
                 # Train
-                train(args, args.learning_rate_schedule_file, epoch, train_set, train_dist, sess, enqueue_op,
-                      lidarscan_paths_placeholder, labels_placeholder, dists_placeholder,
-                      args.embedding_size, embeddings, labels_batch, batch_size_placeholder,
-                      is_training_placeholder, learning_rate_placehloder, total_loss, train_op, global_step,
-                      summary_writer, regularization_losses)
+                _, nan = train(args, args.learning_rate_schedule_file, epoch, train_set, train_dist, sess, enqueue_op,
+                               lidarscan_paths_placeholder, labels_placeholder, dists_placeholder,
+                               args.embedding_size, embeddings, labels_batch, batch_size_placeholder,
+                               is_training_placeholder, learning_rate_placehloder, total_loss, train_op, global_step,
+                               summary_writer, regularization_losses, learning_rate)
+                if nan == True:
+                    break
                 # 源代码里的summary_op并没有被sess运行。但是summary_writer里有写sess
                 # Save variables and the metagraph if it doesn't exist already
                 save_variables_and_metagraph(sess, saver, model_dir, step, subdir, summary_writer)
@@ -181,7 +190,7 @@ def main(args):
 def train(args, learning_rate_schedule_file, epoch, dataset, dataset_dist, sess, enqueue_op,
           lidarscan_paths_placeholder, labels_placeholder, dists_placeholder, embedding_size, embeddings,
           labels_batch, batch_size_placeholder, is_training_placeholder, learning_rate_placeholder,
-          loss, train_op, global_step, summary_writer, reg_loss):
+          loss, train_op, global_step, summary_writer, reg_loss, learning_rate):
     if args.learning_rate > 0.0:
         lr = args.learning_rate
     else:
@@ -209,15 +218,20 @@ def train(args, learning_rate_schedule_file, epoch, dataset, dataset_dist, sess,
     # loss_array = np.zeros((nrof_triplets,))  # 不是应该nrof_batches吗,而且这个array好像用不上; not used
     summary = tf.Summary()
     step = 0
+    nan = False
     for batch_number in range(args.epoch_size):  # all examples are dequeued
         start_time = time.time()
         feed_dict = {batch_size_placeholder: args.pairs_per_batch * 2, learning_rate_placeholder: lr,
                      is_training_placeholder: True}
-        err, reg_err, _, step, emb, lab = sess.run(
-            [loss, reg_loss, train_op, global_step, embeddings, labels_batch],
+        err, reg_err, _, step, emb, lab, lr_decay = sess.run(
+            [loss, reg_loss, train_op, global_step, embeddings, labels_batch, learning_rate],
             feed_dict=feed_dict)  # dequeue batch_size examples for training
-        if err==np.nan:
-            print(lidarscan_paths_array,batch_number+1) # check nan. sometimes loss suddenly becomes nan.
+        if str(err) == 'nan':
+            print(lidarscan_paths_array, batch_number + 1)
+            print(emb)  # check nan. sometimes loss suddenly becomes nan.
+            nan = not nan
+            break
+
         emb_array[lab, :] = emb  # 这里其实用不上，因为train_op里已经计算了 not used
         # loss_array[i] = err # not used
         duration = time.time() - start_time
@@ -226,10 +240,11 @@ def train(args, learning_rate_schedule_file, epoch, dataset, dataset_dist, sess,
               (epoch, batch_number + 1, args.epoch_size, duration, err, reg_err))
         train_time += duration
         summary.value.add(tag='loss', simple_value=err)
+        summary.value.add(tag='learning_rate', simple_value=lr_decay)
 
     summary.value.add(tag='time/train', simple_value=train_time)
     summary_writer.add_summary(summary, step)
-    return step
+    return step, nan
 
 
 def evaluate(args, sess, validation_set, validation_dist, embeddings, enqueue_op, batch_size_placeholder,
@@ -272,7 +287,7 @@ def evaluate(args, sess, validation_set, validation_dist, embeddings, enqueue_op
     evaluate_time = time.time() - start_time
     print('%.3f seconds' % (evaluate_time))
 
-    print('Validation losses: ',validation_loss)
+    print('Validation losses: ', validation_loss)
     validation_loss = np.mean(validation_loss)
     print('Average validation loss: %3.3f' % (validation_loss))
     # Add loss to summary
@@ -336,20 +351,16 @@ def get_paths_pairs(data_dir, pairs_file):
             pairs_paths.append(pair)
             pairs_dists.append(dist)
     assert (len(pairs_paths) == len(pairs_dists))
-    idx = np.arange(len(pairs_dists))
-    np.random.shuffle(idx)
 
-    pairs_paths_shuffle = [pairs_paths[i] for i in idx]
-    pairs_dists_shuffle = [pairs_dists[i] for i in idx]
-
-    return pairs_paths_shuffle, pairs_dists_shuffle
+    return pairs_paths, pairs_dists
 
 
 def parse_arguments(argv):
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--logs_base_dir', type=str,
-                        help='Directory where to write event logs.', default='D:/User/Sisi_Tao/Masterarbeit/logs/train_distance')
+                        help='Directory where to write event logs.',
+                        default='D:/User/Sisi_Tao/Masterarbeit/logs/train_distance')
     parser.add_argument('--models_base_dir', type=str,
                         help='Directory where to write trained models and checkpoints.',
                         default='D:/User/Sisi_Tao/Masterarbeit/models/train_distance')
@@ -357,27 +368,33 @@ def parse_arguments(argv):
                         help='Upper bound on the amount of GPU memory that will be used by the process.', default=1.0)
     parser.add_argument('--pretrained_model', type=str,
                         help='Load a pretrained model before training starts.',
-    default = '../models/train_distance/20190120-172149/model-20190120-172149.ckpt-750')
-    # default = '../models/my_net/20190113-112404/model-20190113-112404.ckpt-0'
+                        default='../models/train_distance/20190213-121503/model-20190213-121503.ckpt-1320')
+    # default='../models/train_distance/20190131-120604/model-20190131-120604.ckpt-2840'
     parser.add_argument('--data_dir', type=str,
                         help='Path to the data directory.',
-                        default='D:/Users/Sisi_Tao/downsampled_data')
+                        default='D:/User/Sisi_Tao/rotated_downsampled_data')
+    parser.add_argument('--nrof_channel', type=int,
+                        help='number of channels of dataset',
+                        default=2)
+    parser.add_argument('--embedding_size', type=int,
+                        help='Dimensionality of the embedding.', default=384)
     parser.add_argument('--pairs_file', type=str,
                         help='Path to the pairs_file.',
-                        default='D:/Users/Sisi_Tao/pairs_file.txt')
+                        default='D:/User/Sisi_Tao/pairs_file_new.txt')
+    parser.add_argument('--map_pairs_file', type=str,
+                        help='Path to the pairs_file.',
+                        default='D:/User/Sisi_Tao/pairs_based_on_map.txt')
     parser.add_argument('--model_def', type=str,
                         help='Model definition. Points to a module containing the definition of the inference graph.',
                         default='model_SqueezeNet')
-    parser.add_argument('--nrof_validation_pairs',type=int,
-                        help='Number of pairs for validation',default=4096)
+    parser.add_argument('--nrof_validation_pairs', type=int,
+                        help='Number of pairs for validation', default=4096)
     parser.add_argument('--max_nrof_epochs', type=int,
                         help='Number of epochs to run.', default=1000)
     parser.add_argument('--pairs_per_batch', type=int,
                         help='Number of pairs per batch.', default=128)
     parser.add_argument('--epoch_size', type=int,
                         help='Number of batches per epoch.', default=40)
-    parser.add_argument('--embedding_size', type=int,
-                        help='Dimensionality of the embedding.', default=200)
     parser.add_argument('--keep_probability', type=float,
                         help='Keep probability of dropout for the convolutional layer(s).Keep probability of dropout '
                              'for the fully connected layer is set to 1', default=0.7)
@@ -387,19 +404,17 @@ def parse_arguments(argv):
                         help='The optimization algorithm to use', default='ADAGRAD')
     parser.add_argument('--learning_rate', type=float,
                         help='Initial learning rate. If set to a negative value a learning rate ' +
-                             'schedule can be specified in the file "learning_rate_schedule.txt"', default=0.05)
+                             'schedule can be specified in the file "learning_rate_schedule.txt"', default=0.0004)
     parser.add_argument('--learning_rate_decay_epochs', type=int,
                         help='Number of epochs between learning rate decay.(not used)', default=100)
     parser.add_argument('--learning_rate_decay_factor', type=float,
-                        help='Learning rate decay factor.(not used)', default=1.0)
+                        help='Learning rate decay factor.(not used)', default=0.2)
     parser.add_argument('--moving_average_decay', type=float,
                         help='Exponential decay for tracking of training parameters.', default=0.9999)
     parser.add_argument('--seed', type=int,
                         help='Random seed.', default=665)
     parser.add_argument('--learning_rate_schedule_file', type=str,
-                        help='File containing the learning rate schedule that is used when learning_rate is set to to -1.',
-                        default='data/learning_rate_schedule.txt')
-
+                        help='learning_rate_schedule_file,not used', default=' ')
     return parser.parse_args(argv)
 
 

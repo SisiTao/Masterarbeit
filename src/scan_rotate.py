@@ -22,7 +22,7 @@ for lidar_file in lidar_list:
                 lidar_data_cutbottom[i][j][k] = lidar_data[i][j][k]
 
     rotate_pixel = np.random.randint(512)
-    rotate_deg = rotate_pixel * 0.703125
+    rotate_deg = rotate_pixel * 0.703125  # 360/512=0.703125
     rotate_deg = np.array(rotate_deg, dtype=np.float64)
     rotate_deg.tofile(os.path.join(out_dir, lidar_file.replace('velodyne_scan', 'rotate_deg')))
     lidar_data_cutbottom = np.reshape(lidar_data_cutbottom, [128, 512])
@@ -38,6 +38,6 @@ for lidar_file in lidar_list:
 
     lidar_data_rotated.tofile(os.path.join(out_dir, lidar_file))
     file_name_gps = lidar_file.replace('velodyne_scan', 'global_ego_data')
-    file_name_odometry=lidar_file.replace('velodyne_scan','local_ego_data')
-    shutil.copyfile(os.path.join(in_dir,file_name_gps),os.path.join(out_dir,file_name_gps))
+    file_name_odometry = lidar_file.replace('velodyne_scan', 'local_ego_data')
+    shutil.copyfile(os.path.join(in_dir, file_name_gps), os.path.join(out_dir, file_name_gps))
     shutil.copyfile(os.path.join(in_dir, file_name_odometry), os.path.join(out_dir, file_name_odometry))

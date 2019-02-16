@@ -48,65 +48,42 @@ def inference(lidarscans, keep_probability, is_training=True, bottleneck_layer_s
                         weights_regularizer=slim.l2_regularizer(weight_decay),
                         normalizer_fn=slim.batch_norm,
                         normalizer_params=batch_norm_params):
-        with tf.variable_scope('squeezenet', values=[lidarscans], reuse=reuse):
+        with tf.variable_scope('squeezenet_new', values=[lidarscans], reuse=reuse):
             with slim.arg_scope([slim.batch_norm, slim.dropout], is_training=is_training):
                 # input: 64 x 512 x 2
+                # 64 x 256 x 32
+                net = slim.conv2d(lidarscans, 32, [3, 3], stride=[1, 2], scope='conv1')
                 # 64 x 128 x 64
-                net = slim.conv2d(lidarscans, 64, [5, 5], stride=[1, 4], scope='conv1')
+                net = slim.conv2d(net, 64, [3, 3], stride=[1, 2], scope='conv2')
                 # 32 x 64 x 64
-                net = slim.max_pool2d(net, [3, 3], stride=2, padding='SAME', scope='maxpool1')
-                # 32 x 64 x 128
-                net = fire_module(net, 16, 64, scope='fire2')
+                net = slim.max_pool2d(net, [3, 3], stride=2, padding='SAME', scope='maxpool2')
                 # 32 x 64 x 128
                 net = fire_module(net, 16, 64, scope='fire3')
+                # 32 x 64 x 128
+                net = fire_module(net, 16, 64, scope='fire4')
+                # 32 x 64 x 128
+                net = fire_module(net, 16, 64, scope='fire5')
                 # 16 x 32 x 128
-                net = slim.max_pool2d(net, [3, 3], stride=2, padding='SAME', scope='maxpool3')
-                # 16 x 32 x 256
-                net = fire_module(net, 32, 128, scope='fire4')
-                # 16 x 32 x 256
-                net = fire_module(net, 32, 128, scope='fire5')
-                # 8 x 16 x 256
                 net = slim.max_pool2d(net, [3, 3], stride=2, padding='SAME', scope='maxpool5')
+                # 16 x 32 x 256
+                net = fire_module(net, 32, 128, scope='fire6')
+                # 16 x 32 x 256
+                net = fire_module(net, 32, 128, scope='fire7')
+                # 8 x 16 x 256
+                net = slim.max_pool2d(net, [3, 3], stride=2, padding='SAME', scope='maxpool7')
                 # 8 x 16 x 512
-                net = fire_module(net, 64, 256, scope='fire6')
+                net = fire_module(net, 64, 256, scope='fire8')
                 # 8 x 16 x 512
-                net = fire_module(net, 64, 256, scope='fire7')
+                net = fire_module(net, 64, 256, scope='fire9')
                 # 4 x 8 x 512
-                net = slim.max_pool2d(net, [2, 2], stride=2, padding='SAME', scope='maxpool7')
-                # 4 x 4 x 768
-                net = slim.conv2d(net, 768, [3, 3], stride=[1, 2], scope='conv8')
-                # 1 x 1 x 768
-                net = slim.avg_pool2d(net, [4, 4], padding='VALID', scope='avgpool9')
-                # 768
+                net = slim.max_pool2d(net, [2, 2], stride=2, padding='SAME', scope='maxpool10')
+                # 4 x 4 x 1000
+                net = slim.conv2d(net, 1000, [3, 3], stride=[1, 2], scope='conv11')
+                # 1 x 1 x 1000
+                net = slim.avg_pool2d(net, [4, 4], padding='VALID', scope='avgpool12')
+                # 1000
                 net = tf.squeeze(net, [1, 2], name='logits')
                 # embedding_size
                 net = slim.fully_connected(net, bottleneck_layer_size, activation_fn=None, scope='Bottleneck',
                                            reuse=False)
-    return net
-
-
-def fully_connected(inputs, keep_probability, input_size, is_training=True, weight_decay=0.0):
-    batch_norm_params = {
-        # Decay for the moving averages.
-        'decay': 0.995,
-        # epsilon to prevent 0s in variance.
-        'epsilon': 0.001,
-        # force in-place updates of mean and variance estimates
-        'updates_collections': None,
-        # Moving averages ends up in the trainable variables collection
-        'variables_collections': [tf.GraphKeys.TRAINABLE_VARIABLES],
-    }
-
-    with slim.arg_scope([slim.conv2d, slim.fully_connected],
-                        weights_initializer=slim.initializers.xavier_initializer(),
-                        weights_regularizer=slim.l2_regularizer(weight_decay),
-                        normalizer_fn=slim.batch_norm,
-                        normalizer_params=batch_norm_params):
-        with tf.variable_scope('fully_connected', values=[inputs]):
-            net = slim.fully_connected(inputs, 700, scope='fc_1')
-            net=slim.fully_connected(net,350,scope='fc_2')
-            net = slim.fully_connected(net, 100, scope='fc_3')
-            net = slim.fully_connected(net, 50, scope='fc_4')
-            net = slim.dropout(net, keep_probability, is_training=is_training)
-            net = slim.fully_connected(net, 2, activation_fn=None, scope='fc_5')
     return net

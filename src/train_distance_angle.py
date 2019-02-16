@@ -37,7 +37,7 @@ def main(args):
     pairs_paths, pairs_dists, pairs_angles = get_paths_pairs(args.data_dir, args.pairs_file)
     # paths_pairs: Returns a list of shuffled paths_pairs shape(?,2)
 
-    nrof_validation_pairs = 64
+    nrof_validation_pairs = args.nrof_validation_pairs
     validation_set = pairs_paths[0:nrof_validation_pairs]
     validation_dist = pairs_dists[0:nrof_validation_pairs]
     validation_angle = pairs_angles[0:nrof_validation_pairs]
@@ -65,8 +65,8 @@ def main(args):
 
         # queue operation
         input_queue = data_flow_ops.FIFOQueue(capacity=100000,
-                                              dtypes=[tf.string, tf.int64, tf.float32],
-                                              shapes=[(2,), (2,), (2,)],
+                                              dtypes=[tf.string, tf.int64, tf.float32,tf.float32],
+                                              shapes=[(2,), (2,), (2,),(2,)],
                                               shared_name=None, name=None)
         enqueue_op = input_queue.enqueue_many(
             [lidarscan_paths_placeholder, labels_placeholder, dists_placeholder, angles_placeholder])
@@ -80,7 +80,7 @@ def main(args):
             for filename in tf.unstack(filenames):
                 file_contents = tf.read_file(filename)
                 lidarscan = tf.decode_raw(file_contents, tf.float32)
-                lidarscan = tf.reshape(lidarscan, [2, 32768])  # for model_cnn.py 64 x 512 = 32768
+                lidarscan = tf.reshape(lidarscan, [3, 32768])  # for model_cnn.py 64 x 512 = 32768
 
                 # per lidarscan normalization
                 mean = tf.reduce_mean(lidarscan, axis=1, keepdims=True)  # ((distance_mean),(reflection_mean))
@@ -91,9 +91,10 @@ def main(args):
                 lidarscan /= std
 
                 # reshape the normalized lidarscan to (64, 512, 2) for model_cnn.py
-                distance_data = lidarscan[0]
-                reflectance_data = lidarscan[1]
-                lidarscan = tf.reshape(tf.stack([distance_data, reflectance_data], axis=1), (64, 512, 2))
+                range_data = lidarscan[0]
+                reflection_data = lidarscan[1]
+                forward_data = lidarscan[2]
+                lidarscan = tf.reshape(tf.stack([range_data, reflection_data, forward_data], axis=1), (64, 512, 3))
                 lidarscans.append(lidarscan)
 
                 # But in CNN the shape should be (height,width,channel) channel can be 2 if only distance and reflectance
@@ -104,7 +105,7 @@ def main(args):
 
         lidarscan_batch, labels_batch, dist_batch, angle_batch = tf.train.batch_join(
             lidarscans_labels_distance_angle, batch_size=batch_size_placeholder,  # ！！！！！batch size??
-            shapes=[(64, 512, 2), (), ()], enqueue_many=True,
+            shapes=[(64, 512, 3), (), (),()], enqueue_many=True,
             capacity=8 * nrof_preprocess_threads * args.pairs_per_batch,
             allow_smaller_final_batch=True)
         lidarscan_batch = tf.identity(lidarscan_batch, 'lidarscan_batch')
@@ -131,11 +132,13 @@ def main(args):
         angle_prediction = prediction[1::2]
 
         dist_batch, _ = tf.unstack(tf.reshape(dist_batch, [-1, 2]), 2, 1)
-        distance_loss = tf.reduce_mean(tf.sqrt(tf.square(tf.subtract(dist_prediction, dist_batch))), 0)
+        # distance_loss = tf.reduce_mean(tf.sqrt(tf.square(tf.subtract(dist_prediction, dist_batch))), 0)
+        distance_loss=tf.reduce_mean(tf.zeros([1]))
         angle_batch, _ = tf.unstack(tf.reshape(angle_batch, [-1, 2]), 2, 1)
         angle_loss = tf.reduce_mean(tf.sqrt(tf.square(tf.subtract(angle_prediction, angle_batch))), 0)
-        learning_rate = learning_rate_placehloder  # 源代码用了exponential_decay; the original code used exponential_decay
-
+        learning_rate = tf.train.exponential_decay(learning_rate_placehloder, global_step,
+                                                   args.learning_rate_decay_epochs * args.epoch_size,
+                                                   args.learning_rate_decay_factor, staircase=True)
         # Calculate the total losses
         regularization_losses = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
         total_loss = tf.add_n([distance_loss] + [angle_loss * args.gamma] + regularization_losses, name='total_loss')
@@ -146,9 +149,6 @@ def main(args):
 
         # Create a saver
         saver = tf.train.Saver(tf.trainable_variables(), max_to_keep=3)
-
-        # Build the summary operation based on the TF collection of Summaries.
-        summary_op = tf.summary.merge_all()  # not used
 
         # Start running operations on the Graph.
         gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=args.gpu_memory_fraction)  # GPU的设置 还没看
@@ -175,13 +175,16 @@ def main(args):
                 step = sess.run(global_step, feed_dict=None)
                 epoch = step // args.epoch_size
                 # Train
-                train(args, args.learning_rate_schedule_file, epoch, train_set, train_dist, train_angle, sess,
-                      enqueue_op,
-                      lidarscan_paths_placeholder, labels_placeholder, dists_placeholder, angles_placeholder,
-                      args.embedding_size, embeddings, labels_batch, batch_size_placeholder,
-                      is_training_placeholder, learning_rate_placehloder, total_loss, distance_loss, angle_loss,
-                      train_op, global_step,
-                      summary_writer, regularization_losses)
+                _, nan = train(args, args.learning_rate_schedule_file, epoch, train_set, train_dist, train_angle, sess,
+                               enqueue_op,
+                               lidarscan_paths_placeholder, labels_placeholder, dists_placeholder, angles_placeholder,
+                               args.embedding_size, embeddings, labels_batch, batch_size_placeholder,
+                               is_training_placeholder, learning_rate_placehloder, total_loss, distance_loss,
+                               angle_loss,
+                               train_op, global_step,
+                               summary_writer, regularization_losses, learning_rate)
+                if nan == True:
+                    break
                 # 源代码里的summary_op并没有被sess运行。但是summary_writer里有写sess
                 # Save variables and the metagraph if it doesn't exist already
                 save_variables_and_metagraph(sess, saver, model_dir, step, subdir, summary_writer)
@@ -200,7 +203,7 @@ def main(args):
 def train(args, learning_rate_schedule_file, epoch, dataset, dataset_dist, dataset_angle, sess, enqueue_op,
           lidarscan_paths_placeholder, labels_placeholder, dists_placeholder, angles_placeholder, embedding_size,
           embeddings, labels_batch, batch_size_placeholder, is_training_placeholder, learning_rate_placeholder,
-          loss, distance_loss, angle_loss, train_op, global_step, summary_writer, reg_loss):
+          loss, distance_loss, angle_loss, train_op, global_step, summary_writer, reg_loss, learning_rate):
     if args.learning_rate > 0.0:
         lr = args.learning_rate
     else:
@@ -236,13 +239,19 @@ def train(args, learning_rate_schedule_file, epoch, dataset, dataset_dist, datas
     # loss_array = np.zeros((nrof_triplets,))  # 不是应该nrof_batches吗,而且这个array好像用不上; not used
     summary = tf.Summary()
     step = 0
+    nan = False
     for batch_number in range(args.epoch_size):  # all examples are dequeued
         start_time = time.time()
         feed_dict = {batch_size_placeholder: args.pairs_per_batch * 2, learning_rate_placeholder: lr,
                      is_training_placeholder: True}
-        err, dist_err, angle_err, reg_err, _, step, emb, lab = sess.run(
-            [loss, distance_loss, angle_loss, reg_loss, train_op, global_step, embeddings, labels_batch],
+        err, dist_err, angle_err, reg_err, _, step, emb, lab, lr_decay = sess.run(
+            [loss, distance_loss, angle_loss, reg_loss, train_op, global_step, embeddings, labels_batch, learning_rate],
             feed_dict=feed_dict)  # dequeue batch_size examples for training
+        if str(err) == 'nan':
+            print(lidarscan_paths_array, batch_number + 1)
+            print(emb)  # check nan. sometimes loss suddenly becomes nan.
+            nan = not nan
+            break
         emb_array[lab, :] = emb  # 这里其实用不上，因为train_op里已经计算了 not used
         # loss_array[i] = err # not used
         duration = time.time() - start_time
@@ -253,10 +262,11 @@ def train(args, learning_rate_schedule_file, epoch, dataset, dataset_dist, datas
         summary.value.add(tag='loss/total_loss', simple_value=err)
         summary.value.add(tag='loss/dist_loss', simple_value=dist_err)
         summary.value.add(tag='loss/angle_loss', simple_value=angle_err)
+        summary.value.add(tag='learning_rate', simple_value=lr_decay)
 
     summary.value.add(tag='time/train', simple_value=train_time)
     summary_writer.add_summary(summary, step)
-    return step
+    return step, nan
 
 
 def evaluate(args, sess, validation_set, validation_dist, validation_angle, embeddings, enqueue_op,
@@ -305,7 +315,7 @@ def evaluate(args, sess, validation_set, validation_dist, validation_angle, embe
         emb_array[lab, :] = emb
         validation_dist_loss.append(dist_err)
         validation_angle_loss.append(angle_err)
-        validation_loss.append(dist_err + angle_err)
+        validation_loss.append(dist_err + args.gamma*angle_err)
         label_check_array[lab] = 1
     assert (np.all(label_check_array == 1))  # check all emb computed
 
@@ -400,49 +410,51 @@ def parse_arguments(argv):
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--logs_base_dir', type=str,
-                        help='Directory where to write event logs.', default='../logs/train_distance')
+                        help='Directory where to write event logs.',
+                        default='D:/User/Sisi_Tao/Masterarbeit/logs/train_distance_angle')
     parser.add_argument('--models_base_dir', type=str,
                         help='Directory where to write trained models and checkpoints.',
-                        default='../models/train_distance')
+                        default='D:/User/Sisi_Tao/Masterarbeit/models/train_distance_angle')
     parser.add_argument('--gpu_memory_fraction', type=float,
                         help='Upper bound on the amount of GPU memory that will be used by the process.', default=1.0)
     parser.add_argument('--pretrained_model', type=str,
-                        help='Load a pretrained model before training starts.',
-                        default='../models/train_distance/20190120-172149/model-20190120-172149.ckpt-750')
+                        help='Load a pretrained model before training starts.')
     # default = '../models/my_net/20190113-112404/model-20190113-112404.ckpt-0'
     parser.add_argument('--data_dir', type=str,
                         help='Path to the data directory.',
-                        default='C:/Users/Stadtpilot/Desktop/datasets/downsampled_data')
+                        default='D:/User/Sisi_Tao/rotated_downsampled_data_3channels')
     parser.add_argument('--pairs_file', type=str,
                         help='Path to the pairs_file.',
-                        default='C:/Users/Stadtpilot/Desktop/datasets/pairs_file.txt')
+                        default='D:/User/Sisi_Tao/pairs_file_dist_angle.txt')
     parser.add_argument('--model_def', type=str,
                         help='Model definition. Points to a module containing the definition of the inference graph.',
-                        default='model_cnn')
+                        default='model_SqueezeNet')
+    parser.add_argument('--nrof_validation_pairs', type=int,
+                        help='Number of pairs for validation', default=4096)
     parser.add_argument('--max_nrof_epochs', type=int,
-                        help='Number of epochs to run.', default=150)
+                        help='Number of epochs to run.', default=1000)
     parser.add_argument('--pairs_per_batch', type=int,
-                        help='Number of pairs per batch.', default=64)
+                        help='Number of pairs per batch.', default=128)
     parser.add_argument('--epoch_size', type=int,
-                        help='Number of batches per epoch.', default=5)
+                        help='Number of batches per epoch.', default=40)
     parser.add_argument('--embedding_size', type=int,
-                        help='Dimensionality of the embedding.', default=128)
+                        help='Dimensionality of the embedding.', default=256)
     parser.add_argument('--keep_probability', type=float,
                         help='Keep probability of dropout for the convolutional layer(s).Keep probability of dropout '
-                             'for the fully connected layer is set to 1', default=0.8)
+                             'for the fully connected layer is set to 1', default=0.7)
     parser.add_argument('--gamma', type=float,
                         help='scale factor of angle loss.', default=0.5)
     parser.add_argument('--weight_decay', type=float,
-                        help='L2 weight regularization.', default=0.000)
+                        help='L2 weight regularization.', default=0.001)
     parser.add_argument('--optimizer', type=str, choices=['ADAGRAD', 'ADADELTA', 'ADAM', 'RMSPROP', 'MOM'],
                         help='The optimization algorithm to use', default='ADAGRAD')
     parser.add_argument('--learning_rate', type=float,
                         help='Initial learning rate. If set to a negative value a learning rate ' +
-                             'schedule can be specified in the file "learning_rate_schedule.txt"', default=0.1)
+                             'schedule can be specified in the file "learning_rate_schedule.txt"', default=0.5)
     parser.add_argument('--learning_rate_decay_epochs', type=int,
-                        help='Number of epochs between learning rate decay.(not used)', default=100)
+                        help='Number of epochs between learning rate decay.(not used)', default=200)
     parser.add_argument('--learning_rate_decay_factor', type=float,
-                        help='Learning rate decay factor.(not used)', default=1.0)
+                        help='Learning rate decay factor.(not used)', default=0.2)
     parser.add_argument('--moving_average_decay', type=float,
                         help='Exponential decay for tracking of training parameters.', default=0.9999)
     parser.add_argument('--seed', type=int,
