@@ -6,34 +6,43 @@ import json
 from scipy.optimize import leastsq
 
 # Estimation parameter of PF
-Q = np.diag([1]) ** 2  # range error
+Q = np.diag([0.3]) ** 2  # range error
 # R = np.diag([1.0, 1.0]) ** 2  # input error
 
 #  Simulation parameter
 # Qsim = np.diag([0.2]) ** 2
-Rsim = np.diag([1.8, np.deg2rad(40.0)]) ** 2
-
+Rsim = np.diag([1., np.deg2rad(40.0)]) ** 2
+print('Q:\t', Q)
+print('R:\t', Rsim)
 DT = 0.1  # time tick [s]
 SIM_TIME = 50.0  # simulation time [s]
-MAX_RANGE = 100.0  # maximum observation range
+MAX_RANGE = 50.0  # maximum observation range
 
 # Particle filter parameter
-NP = 1000  # Number of Particle
+NP = 100  # Number of Particle
 NTh = NP / 10.0  # Number of particle for re-sampling
 
+nrof_RFID_around=3
 show_animation = True
 
 
-def calc_input(v, yaw):
+def calc_input(v, yawrate):
     # v [m/s] yawrate [rad/s]
-    u = np.array([[v, yaw]]).T
+    u = np.array([[v, yawrate]]).T
     return u
 
 
-def observation(xd, u, RFID, embeddings_around, embedding):
+def observation(xd, u, RFID, embeddings_around, embedding, xEst):
+    yaw = xEst[2, 0]
+    if np.tan(yaw) >= 0:
+        p0 = np.array([xEst[0, 0] - 100, xEst[1, 0] + 100])
+        p1 = np.array([xEst[0, 0] + 100, xEst[1, 0] - 100])
+    else:
+        p0 = np.array([xEst[0, 0] + 100, xEst[1, 0] + 100])
+        p1 = np.array([xEst[0, 0] - 100, xEst[1, 0] - 100])
     # add noise to gps x-y
     z = np.zeros((0, 3))
-    p0 = np.array([0., 0.])
+
     Di = []
     Xi = []
     Yi = []
@@ -49,8 +58,12 @@ def observation(xd, u, RFID, embeddings_around, embedding):
     Di = np.array(Di)
     Xi = np.array(Xi)
     Yi = np.array(Yi)
-    p = leastsq(error, p0, (Xi, Yi, Di))
-    x, y = p[0]
+    p0 = leastsq(error, p0, (Xi, Yi, Di))
+    p1 = leastsq(error, p1, (Xi, Yi, Di))
+    x0, y0 = p0[0]
+    x1, y1 = p1[0]
+    x = (x0 + x1) / 2
+    y = (y0 + y1) / 2
     z = np.array([x, y])
 
     # add noise to input
@@ -72,13 +85,16 @@ def dist(p, x, y):
 
 
 def motion_model(x, u):
-    F = np.array([[1.0, 0],
-                  [0, 1.0]])
+    F = np.array([[1.0, 0, 0, 0],
+                  [0, 1.0, 0, 0],
+                  [0, 0, 1.0, 0],
+                  [0, 0, 0, 0]])
 
-    B = np.array([[DT, 0],
-                  [0, DT]])
-    u_=np.array([[u[0,0]*math.cos(-u[1,0])],[u[0,0]*math.sin(u[1,0])]])
-    x = F.dot(x) + B.dot(u_)
+    B = np.array([[DT * math.cos(x[2, 0]), 0],
+                  [DT * math.sin(x[2, 0]), 0],
+                  [0.0, DT],
+                  [1.0, 0.0]])
+    x = F.dot(x) + B.dot(u)
 
     return x
 
@@ -142,7 +158,6 @@ def resampling(px, pw):
 
     Neff = 1.0 / (pw.dot(pw.T))[0, 0]  # Effective particle number
     if Neff < NTh:
-        print('resampling')
         wcum = np.cumsum(pw)
         base = np.cumsum(pw * 0.0 + 1 / NP) - 1 / NP
         resampleid = base + np.random.rand(base.shape[0]) / NP
@@ -202,13 +217,13 @@ def main(start_point_idx, end_point_idx):
     time = 0.0
 
     # inputs
-    data_dir = 'C:/Users/Stadtpilot/Desktop/datasets/downsampled_data'
-    map_file = 'C:/Users/Stadtpilot/Desktop/datasets/map_file.txt'
+    data_dir = 'C:/Users/Stadtpilot/Desktop/datasets/2017_01_27_Ring_raw_without_video'
+    map_file = 'C:/Users/Stadtpilot/Desktop/datasets/map_file_15.txt'
     sorted_file_names = [name for name in sorted(os.listdir(data_dir)) if os.path.isfile(os.path.join(data_dir, name))]
 
     # get embeddings for map_points and datapoints
-    embeddings_file_map = 'C:/Users/Stadtpilot/Desktop/datasets/embeddings_files/embeddings_file_map_20_384.txt'
-    embeddings_file_all = 'C:/Users/Stadtpilot/Desktop/datasets/embeddings_files/embeddings_file_downsampled_data_384.txt'
+    embeddings_file_map = 'C:/Users/Stadtpilot/Desktop/datasets/embeddings_files/embeddings_file_map_15_384.txt'
+    embeddings_file_all = 'C:/Users/Stadtpilot/Desktop/datasets/embeddings_files/embeddings_file_downsampled_data_384_175555.txt'
     with open(embeddings_file_map, 'r') as fr:
         data = fr.readline()
         embedding_dict_map = json.loads(data)
@@ -241,10 +256,13 @@ def main(start_point_idx, end_point_idx):
     global_ego_data = np.fromfile(os.path.join(data_dir, global_ego_list[start_point_idx]), dtype=np.float64)
     xEst_x = global_ego_data[16]
     xEst_y = global_ego_data[17]
-    xEst = np.array([[xEst_x], [xEst_y]])
+    xEst_yaw = global_ego_data[4]
+    xEst_v = np.sqrt(global_ego_data[13] ** 2 + global_ego_data[14] ** 2)
+    xEst = np.array([[xEst_x], [xEst_y], [xEst_yaw], [xEst_v]])
     xTrue = xEst
 
-    px = np.stack((np.tile([xEst_x], NP), np.tile([xEst_y], NP)))  # Particle store
+    px = np.stack((np.tile([xEst_x], NP), np.tile([xEst_y], NP), np.tile([xEst_yaw], NP),
+                   np.tile([xEst_v], NP)))  # Particle store
     pw = np.zeros((1, NP)) + 1.0 / NP  # Particle weight
     xDR = xEst  # Dead reckoning
 
@@ -252,9 +270,12 @@ def main(start_point_idx, end_point_idx):
     hxEst = xEst
     hxTrue = xTrue
     hxDR = xTrue
-
+    err_x_list = []
+    err_y_list = []
+    err_list = []
     print('calculate start')
-    for global_ego_file, local_ego_file in combined_list[start_point_idx:end_point_idx - 1]:
+    old_idx = 0
+    for global_ego_file, local_ego_file in combined_list[start_point_idx:end_point_idx]:
         time += DT
 
         # embedding of this point
@@ -264,22 +285,29 @@ def main(start_point_idx, end_point_idx):
         local_ego_data = np.fromfile(os.path.join(data_dir, local_ego_file), dtype=np.float64)
         v_longitudinal = local_ego_data[7]
         v_lateral = local_ego_data[8]
-        yaw=local_ego_data[4]
-        v=np.sqrt(v_longitudinal**2+v_lateral**2)
-        u = calc_input(v, yaw)
+        yawrate = local_ego_data[10]
+        v = np.sqrt(v_longitudinal ** 2 + v_lateral ** 2)
+        u = calc_input(v, yawrate)
 
         # xTrue
         global_ego_data = np.fromfile(os.path.join(data_dir, global_ego_file), dtype=np.float64)
-        xTrue = np.array([[global_ego_data[16]], [global_ego_data[17]]])
+        xTrue = np.array([[global_ego_data[16]], [global_ego_data[17]], [0.], [0.]])
 
         # observation
         RFID_around = []
+
         embeddings_around = []
         dists = []
-        for RFID_data in RFID:
+        if old_idx <= 10:
+            start_idx = 0
+        else:
+            start_idx = old_idx - 10
+        end_idx = old_idx + 10
+        for r in range(start_idx, end_idx):
+            RFID_data = RFID[r]
             dist = np.sqrt((RFID_data[1] - xEst[0, 0]) ** 2 + (RFID_data[2] - xEst[1, 0]) ** 2)
             if dist < MAX_RANGE:
-                if len(RFID_around) == 3:
+                if len(RFID_around) == nrof_RFID_around:
                     if dist < max(dists):
                         max_idx = dists.index(max(dists))
                         dists.remove(max(dists))
@@ -290,20 +318,29 @@ def main(start_point_idx, end_point_idx):
                         embeddings_around.append(
                             embedding_dict_map[RFID_data[0].replace('global_ego_data', 'velodyne_scan')])
                         RFID_around.append(RFID_data)
+                        old_idx = r
                 else:
                     RFID_around.append(RFID_data)
                     embeddings_around.append(
                         embedding_dict_map[RFID_data[0].replace('global_ego_data', 'velodyne_scan')])
                     dists.append(dist)
+                    old_idx = r
+
         RFID_around = np.array(RFID_around)
         if RFID_around.size == 0:
             print(global_ego_file)
             print(RFID_around[:, 0])
             print(len(RFID_around[:, 0]))
 
-        z, xDR, ud = observation(xDR, u, RFID_around, embeddings_around, embedding)
+        z, xDR, ud = observation(xDR, u, RFID_around, embeddings_around, embedding, xEst)
 
         xEst, PEst, px, pw = pf_localization(px, pw, z, ud)
+        err_x = np.abs(xEst[0, 0] - xTrue[0, 0])
+        err_y = np.abs(xEst[1, 0] - xTrue[1, 0])
+        err_x_list.append(err_x)
+        err_y_list.append(err_y)
+        err_list.append(np.sqrt(err_x ** 2 + err_y ** 2))
+        print(np.sqrt(err_x ** 2 + err_y ** 2))
 
         # store data history
         hxEst = np.hstack((hxEst, xEst))
@@ -328,6 +365,15 @@ def main(start_point_idx, end_point_idx):
             plt.grid(True)
             plt.pause(0.001)
 
+    avg_err_x = np.mean(np.array(err_x_list))
+    avg_err_y = np.mean(np.array(err_y_list))
+    avg_err = np.mean(np.array(err_list))
+    print('err_x:\t', avg_err_x)
+    print('err_y:\t', avg_err_y)
+    print('err:\t', avg_err)
+    print('Q:\t', Q)
+    print('R:\t', Rsim)
+
 
 if __name__ == '__main__':
-    main(0, 8000)
+    main(0, 10000)
